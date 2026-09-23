@@ -88,3 +88,13 @@ failing, and the engine yielded 25. The engine was right. The cache holds K/V fo
 sampled from position 63's logits is the 65th and needs no slot until it is fed back in as input. So a
 request can emit one more token than the cache has slots for its context. The expectation is now
 `64 - 40 + 1`, with the reasoning in a comment.
+
+**Gate 7's hash-collision test could not detect a missing parent hash.** Mutation testing against the
+real-model gates planted two bugs aimed at them. A top-left causal mask was caught by gate 8 (logit error
+16 at the first chunked step). A block hash without its parent was not: the test's request B differed from
+the cached request A in its first block, and prefix lookup stops at the first miss, so B never reached
+the colliding middle blocks. A missing parent only matters when a request's first blocks are genuine
+hits and the next block has the same tokens as a block cached under a different prefix. The test now
+builds exactly that (B = X + M, where X is shared with request C and M's cached copy sits after A's Z).
+With the planted bug, B reuses 32 cached tokens instead of 16 and its first-step logits are off by 1.0:
+plausible-looking, wrong output, the failure the plan warns about.
