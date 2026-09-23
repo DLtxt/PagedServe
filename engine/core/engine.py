@@ -21,14 +21,21 @@ from engine.core.model_runner import ModelRunner
 from engine.core.sampler import IncrementalDetokenizer, Sampler
 from engine.core.scheduler import ScheduledBatch, Scheduler
 from engine.core.sequence import RequestOutput, SamplingParams, Sequence
+from engine.distributed.executor import DistributedExecutor, LocalExecutor
+from engine.distributed.parallel import SINGLE, ParallelState
 
 logger = logging.getLogger(__name__)
 
 
 class LLMEngine:
-    def __init__(self, config: EngineConfig, model=None, tokenizer=None) -> None:
+    def __init__(self, config: EngineConfig, model=None, tokenizer=None, parallel: ParallelState | None = None) -> None:
         """Load the model (unless one is passed in), size and allocate the KV cache, wire the
-        scheduler. Tests pass a preloaded model and tokenizer to avoid reloading weights."""
+        scheduler. Tests pass a preloaded model and tokenizer to avoid reloading weights. With tensor
+        or pipeline parallelism this process is rank 0, the driver: `parallel` comes from
+        init_parallel (under torchrun) or local_cluster, and the other ranks run engine.distributed.worker."""
+        parallel = parallel or SINGLE
+        if config.world_size != parallel.world_size:
+            raise ValueError(f"config asks for {config.world_size} ranks but the process group has {parallel.world_size}")
         if model is None:
             from transformers import AutoTokenizer
 
@@ -36,22 +43,23 @@ class LLMEngine:
 
             path = resolve_model_path(config.model)
             config.resolve(load_config(path).max_position_embeddings)
-            model = load_model(path, config.device, config.torch_dtype)
-            tokenizer = tokenizer or AutoTokenizer.from_pretrained(path)
+            model = load_model(path, config.device, config.torch_dtype, parallel)
+            if tokenizer is None and any((path / f).exists() for f in ("tokenizer.json", "tokenizer_config.json")):
+                tokenizer = AutoTokenizer.from_pretrained(path)  # a checkpoint without one serves token ids only
         else:
             config.resolve(model.config.max_position_embeddings)
         self.config = config
+        self.parallel = parallel
         self.model = model
         self.tokenizer = tokenizer
         self.vocab_size = model.config.vocab_size
         self.sampler = Sampler(config.device, config.seed)
-        self.model_runner = ModelRunner(model, config)
-
-        num_blocks = config.num_blocks or self.model_runner.profile_num_blocks(self.sampler)
-        num_cpu_blocks = 0
-        if config.preemption_mode == "swap":
-            num_cpu_blocks = int(config.swap_space_gb * (1 << 30)) // self.model_runner.bytes_per_block
-        self.model_runner.allocate_kv_cache(num_blocks, num_cpu_blocks)
+        self.model_runner = ModelRunner(model, config, parallel)
+        num_blocks, num_cpu_blocks = self.model_runner.size_and_allocate(self.sampler)
+        if parallel.distributed:
+            self.executor = DistributedExecutor(parallel, self.model_runner, self.sampler, config.block_size)
+        else:
+            self.executor = LocalExecutor(self.model_runner, self.sampler)
         capacity = num_blocks * config.block_size
         if config.max_model_len > capacity:
             logger.warning(
@@ -64,6 +72,8 @@ class LLMEngine:
         self.scheduler = Scheduler(config, self.block_manager, model.config.eos_token_ids)
 
         self.logits_hook: Callable[[ScheduledBatch, torch.Tensor], None] | None = None  # debugging and tests
+        # Distributed runs, where full logits live on another rank: (batch, top-k ids, top-k values).
+        self.topk_hook: Callable[[ScheduledBatch, torch.Tensor, torch.Tensor], None] | None = None
         self.num_steps = 0
         self.num_generated_tokens = 0
         self._ids = itertools.count()
@@ -85,13 +95,13 @@ class LLMEngine:
                 raise RuntimeError(f"scheduler made no progress with work pending: {self.scheduler.describe()}")
             return outputs
         start = time.perf_counter()
-        sampling = self.sampler.prepare(batch.sampling_params)
-        logits = self.model_runner.execute(batch)
-        if logits is not None and self.logits_hook is not None:
-            self.logits_hook(batch, logits)
-        tokens = self.sampler(logits, sampling) if logits is not None else []
-        outputs = self.scheduler.update(batch, tokens)
-        self._after_step(batch, len(tokens), time.perf_counter() - start)
+        result = self.executor.execute(batch)
+        if result.logits is not None and self.logits_hook is not None:
+            self.logits_hook(batch, result.logits)
+        if result.topk is not None and self.topk_hook is not None:
+            self.topk_hook(batch, *result.topk)
+        outputs = self.scheduler.update(batch, result.tokens)
+        self._after_step(batch, len(result.tokens), time.perf_counter() - start)
         return outputs
 
     def validate(self, seq: Sequence) -> None:
@@ -111,6 +121,10 @@ class LLMEngine:
         if seq.detokenizer is None and self.tokenizer is not None:
             seq.detokenizer = IncrementalDetokenizer(self.tokenizer)
         self.scheduler.add(seq)
+
+    def shutdown(self) -> None:
+        """Release the other ranks (a no-op in a single process)."""
+        self.executor.shutdown()
 
     def abort(self, seq_id: int) -> None:
         self.scheduler.abort(seq_id)  # frees blocks; a no-op for finished or unknown ids

@@ -8,6 +8,13 @@ gate/up projections are fused into single matmuls, and the model takes a flat to
 
 Attention is delegated to a backend object (engine/model/attention.py) which owns the KV cache;
 the model never sees block tables.
+
+Tensor parallelism splits each layer across ranks, Megatron-style: q/k/v and gate/up are split by
+output (heads, intermediate columns), o_proj and down_proj by input, and an all-reduce after each of
+those two sums the partial results, two per layer. The embedding and lm_head are split by vocabulary.
+Pipeline parallelism gives each stage a contiguous block of layers: the first stage embeds, the last
+normalizes and computes logits. With the default single-process ParallelState every all-reduce is a
+no-op and every size is the full one.
 """
 
 from __future__ import annotations
@@ -18,6 +25,8 @@ from typing import Protocol
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from engine.distributed.parallel import SINGLE, ParallelState, layer_range, tp_all_reduce
 
 
 @dataclass(frozen=True)
@@ -74,6 +83,26 @@ class AttentionFn(Protocol):
         ...
 
 
+class VocabParallelEmbedding(nn.Module):
+    """An embedding table split by rows across tensor-parallel ranks. Each rank looks up the ids that
+    fall in its slice and contributes zeros for the rest; an all-reduce assembles every row."""
+
+    def __init__(self, vocab_size: int, dim: int, parallel: ParallelState) -> None:
+        super().__init__()
+        self.parallel = parallel
+        self.per_rank = vocab_size // parallel.tp_size
+        self.start = parallel.tp_rank * self.per_rank
+        self.weight = nn.Parameter(torch.empty(self.per_rank, dim))
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        if self.parallel.tp_size == 1:
+            return F.embedding(ids, self.weight)
+        local = ids - self.start
+        inside = (local >= 0) & (local < self.per_rank)
+        out = F.embedding(local.clamp(0, self.per_rank - 1), self.weight) * inside.unsqueeze(-1).to(self.weight.dtype)
+        return tp_all_reduce(self.parallel, out)
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float) -> None:
         super().__init__()
@@ -111,11 +140,12 @@ class RotaryEmbedding(nn.Module):
 
 
 class Qwen3Attention(nn.Module):
-    def __init__(self, cfg: Qwen3Config, layer_idx: int) -> None:
+    def __init__(self, cfg: Qwen3Config, layer_idx: int, parallel: ParallelState = SINGLE) -> None:
         super().__init__()
-        self.layer_idx = layer_idx
-        self.num_heads = cfg.num_attention_heads
-        self.num_kv_heads = cfg.num_key_value_heads
+        self.layer_idx = layer_idx  # index within this stage's layers, which is how the KV cache is indexed
+        self.parallel = parallel
+        self.num_heads = cfg.num_attention_heads // parallel.tp_size  # this rank's heads
+        self.num_kv_heads = cfg.num_key_value_heads // parallel.tp_size
         self.head_dim = cfg.head_dim
         self.q_size = self.num_heads * self.head_dim  # 2048 for 0.6B, twice hidden_size
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -134,26 +164,27 @@ class Qwen3Attention(nn.Module):
         q, k = rotary(positions, q, k)
         # Trap 3: 8 KV heads serve 16 query heads; the backend handles the GQA expansion.
         out = attn(self.layer_idx, q, k, v)
-        return self.o_proj(out.reshape(t, self.q_size))
+        return tp_all_reduce(self.parallel, self.o_proj(out.reshape(t, self.q_size)))
 
 
 class Qwen3MLP(nn.Module):
-    def __init__(self, cfg: Qwen3Config) -> None:
+    def __init__(self, cfg: Qwen3Config, parallel: ParallelState = SINGLE) -> None:
         super().__init__()
-        self.intermediate_size = cfg.intermediate_size
-        self.gate_up_proj = nn.Linear(cfg.hidden_size, 2 * cfg.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
+        self.parallel = parallel
+        self.intermediate_size = cfg.intermediate_size // parallel.tp_size  # this rank's columns
+        self.gate_up_proj = nn.Linear(cfg.hidden_size, 2 * self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, cfg.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate, up = self.gate_up_proj(x).split(self.intermediate_size, dim=-1)
-        return self.down_proj(F.silu(gate) * up)
+        return tp_all_reduce(self.parallel, self.down_proj(F.silu(gate) * up))
 
 
 class Qwen3DecoderLayer(nn.Module):
-    def __init__(self, cfg: Qwen3Config, layer_idx: int) -> None:
+    def __init__(self, cfg: Qwen3Config, layer_idx: int, parallel: ParallelState = SINGLE) -> None:
         super().__init__()
-        self.self_attn = Qwen3Attention(cfg, layer_idx)
-        self.mlp = Qwen3MLP(cfg)
+        self.self_attn = Qwen3Attention(cfg, layer_idx, parallel)
+        self.mlp = Qwen3MLP(cfg, parallel)
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
 
@@ -163,23 +194,39 @@ class Qwen3DecoderLayer(nn.Module):
 
 
 class Qwen3ForCausalLM(nn.Module):
-    def __init__(self, cfg: Qwen3Config) -> None:
+    def __init__(self, cfg: Qwen3Config, parallel: ParallelState = SINGLE) -> None:
         super().__init__()
         self.config = cfg
-        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
-        self.layers = nn.ModuleList(Qwen3DecoderLayer(cfg, i) for i in range(cfg.num_hidden_layers))
-        self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
+        self.parallel = parallel
+        self.first_layer, last_layer = layer_range(cfg.num_hidden_layers, parallel.pp_size, parallel.pp_rank)
+        self.num_local_layers = last_layer - self.first_layer
+        self.num_local_heads = cfg.num_attention_heads // parallel.tp_size
+        self.num_local_kv_heads = cfg.num_key_value_heads // parallel.tp_size
+        first, last = parallel.is_first_stage, parallel.is_last_stage
+        # The first stage embeds; with tied weights the last stage needs the same table for logits.
+        needs_embedding = first or (last and cfg.tie_word_embeddings)
+        self.embed_tokens = VocabParallelEmbedding(cfg.vocab_size, cfg.hidden_size, parallel) if needs_embedding else None
+        self.layers = nn.ModuleList(Qwen3DecoderLayer(cfg, i, parallel) for i in range(self.num_local_layers))
+        self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps) if last else None
         self.rotary = RotaryEmbedding(cfg.head_dim, cfg.rope_theta, cfg.max_position_embeddings)
-        self.lm_head = None if cfg.tie_word_embeddings else nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.lm_head = None
+        if last and not cfg.tie_word_embeddings:
+            self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size // parallel.tp_size, bias=False)
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, attn: AttentionFn) -> torch.Tensor:
+    def forward(
+        self, input_ids: torch.Tensor, positions: torch.Tensor, attn: AttentionFn, hidden: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """input_ids, positions: [T] for every token of every sequence in the batch, flattened.
-        Returns final hidden states [T, hidden_size]."""
-        hidden = self.embed_tokens(input_ids)
+        Later pipeline stages pass the previous stage's `hidden` instead of embedding. Returns
+        hidden states [T, hidden_size], normalized on the last stage."""
+        if hidden is None:
+            hidden = self.embed_tokens(input_ids)
         for layer in self.layers:
             hidden = layer(positions, hidden, self.rotary, attn)
-        return self.norm(hidden)
+        return self.norm(hidden) if self.norm is not None else hidden
 
     def compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Logits over this rank's slice of the vocabulary (the whole vocabulary without tensor
+        parallelism)."""
         weight = self.embed_tokens.weight if self.lm_head is None else self.lm_head.weight
         return F.linear(hidden, weight)

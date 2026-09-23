@@ -79,3 +79,29 @@ class LogitsRecorder:
                 steps.append(at(logits[row], self.refs[seq.seq_id][seq.num_output_tokens]))
             else:
                 steps.append(None)  # past the end of the reference: nothing to compare
+
+
+def at_topk(ids: torch.Tensor, values: torch.Tensor, ref: TopK) -> torch.Tensor:
+    """Our logits at the reference's top-k ids, looked up in our own (wider) top-k. A reference id
+    missing from ours comes back NaN, which fails any tolerance check: it means the logits differ by
+    more than the gap between our top-k and the rest."""
+    lookup = dict(zip(ids.tolist(), values.tolist()))
+    return torch.tensor([lookup.get(i, float("nan")) for i in ref.ids.tolist()])
+
+
+class TopKRecorder:
+    """An engine.topk_hook for distributed runs, where full logits live on another rank: records, per
+    request and output step, our logits at the reference run's top-k ids."""
+
+    def __init__(self, refs: dict[int, list[TopK]]) -> None:
+        self.refs = refs
+        self.steps: dict[int, list] = {}
+
+    def __call__(self, batch, ids: torch.Tensor, values: torch.Tensor) -> None:
+        sampling = [seq for seq, sample in zip(batch.seqs, batch.do_sample) if sample]
+        for row, seq in enumerate(sampling):
+            steps = self.steps.setdefault(seq.seq_id, [])
+            assert len(steps) == seq.num_output_tokens, "top-k recorded out of order"
+            ref = self.refs[seq.seq_id]
+            step = seq.num_output_tokens
+            steps.append(at_topk(ids[row], values[row], ref[step]) if step < len(ref) else None)

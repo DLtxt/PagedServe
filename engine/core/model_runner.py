@@ -24,6 +24,7 @@ import torch.nn.functional as F
 
 from engine.config import EngineConfig
 from engine.core.sampler import Sampler
+from engine.distributed.parallel import SINGLE, ParallelState, all_ranks_min, recv_from_prev_stage, send_to_next_stage
 from engine.core.scheduler import ScheduledBatch
 from engine.core.sequence import SamplingParams
 from engine.model.attention import AttentionMetadata, KVCache, NaivePagedAttention
@@ -32,15 +33,18 @@ logger = logging.getLogger(__name__)
 
 
 class ModelRunner:
-    def __init__(self, model, config: EngineConfig) -> None:
+    def __init__(self, model, config: EngineConfig, parallel: ParallelState = SINGLE) -> None:
         self.model = model
         self.config = config
+        self.parallel = parallel
         self.device = torch.device(config.device)
         self.dtype = config.torch_dtype
         mcfg = model.config
-        self.num_layers = mcfg.num_hidden_layers
-        self.num_heads = mcfg.num_attention_heads
-        self.num_kv_heads = mcfg.num_key_value_heads
+        # This rank's share: its pipeline stage's layers and its tensor-parallel slice of the heads.
+        self.num_layers = getattr(model, "num_local_layers", mcfg.num_hidden_layers)
+        self.num_heads = getattr(model, "num_local_heads", mcfg.num_attention_heads)
+        self.num_kv_heads = getattr(model, "num_local_kv_heads", mcfg.num_key_value_heads)
+        self.hidden_size = getattr(mcfg, "hidden_size", None)
         self.head_dim = mcfg.head_dim
         self.vocab_size = mcfg.vocab_size
         self.block_size = config.block_size
@@ -53,6 +57,20 @@ class ModelRunner:
     @property
     def bytes_per_block(self) -> int:
         return KVCache.bytes_per_block(self.num_layers, self.block_size, self.num_kv_heads, self.head_dim, self.dtype)
+
+    def size_and_allocate(self, sampler: Sampler) -> tuple[int, int]:
+        """Decide how many GPU and host blocks this rank holds, agree on them with every other rank,
+        and allocate. Block ids are global under tensor and pipeline parallelism, so every rank must
+        hold the same counts: each sizes its own cache, then all take the smallest."""
+        cfg = self.config
+        num_blocks = cfg.num_blocks or self.profile_num_blocks(sampler)
+        num_cpu_blocks = 0
+        if cfg.preemption_mode == "swap":
+            num_cpu_blocks = int(cfg.swap_space_gb * (1 << 30)) // self.bytes_per_block
+        num_blocks = all_ranks_min(self.parallel, num_blocks)
+        num_cpu_blocks = all_ranks_min(self.parallel, num_cpu_blocks)
+        self.allocate_kv_cache(num_blocks, num_cpu_blocks)
+        return num_blocks, num_cpu_blocks
 
     def allocate_kv_cache(self, num_blocks: int, num_cpu_blocks: int) -> None:
         self.kv_cache = KVCache(
@@ -80,8 +98,9 @@ class ModelRunner:
 
     @torch.inference_mode()
     def execute(self, batch: ScheduledBatch) -> torch.Tensor | None:
-        """Run the batch's swaps and forward pass. Returns logits [num_sampling_seqs, vocab] in batch
-        order, or None when no sequence samples this step (only intermediate prefill chunks)."""
+        """Run the batch's swaps and this rank's share of the forward pass. Returns logits
+        [num_sampling_seqs, vocab (this rank's slice under tensor parallelism)] in batch order, or
+        None when no sequence samples this step or this rank is not on the last pipeline stage."""
         if batch.swap_out:
             self._swap_out(batch.swap_out)
         if batch.swap_in:
@@ -92,7 +111,17 @@ class ModelRunner:
             return self.graph_runner.run(batch)
         input_ids, positions, logits_indices, meta = self.prepare(batch)
         self.backend.begin_step(meta)
-        hidden = self.model(input_ids, positions, self.backend)
+        ps = self.parallel
+        if not ps.distributed:
+            hidden = self.model(input_ids, positions, self.backend)
+        else:
+            hidden_in = None
+            if not ps.is_first_stage:
+                hidden_in = recv_from_prev_stage(ps, (len(positions), self.hidden_size), self.dtype, self.device)
+            hidden = self.model(input_ids, positions, self.backend, hidden_in)
+            if not ps.is_last_stage:
+                send_to_next_stage(ps, hidden)
+                return None
         if not any(batch.do_sample):
             return None
         return self.model.compute_logits(hidden.index_select(0, logits_indices))
@@ -190,9 +219,20 @@ class ModelRunner:
         lens[-1] += num_tokens - sum(lens)
         input_ids = torch.zeros(num_tokens, dtype=torch.int64, device=device)
         positions = torch.cat([torch.arange(n, device=device) for n in lens])
-        hidden = self.model(input_ids, positions, _ProfileAttention(lens))
-        logits = self.model.compute_logits(hidden[:num_seqs])
-        sampler(logits, sampler.prepare([SamplingParams(temperature=1.0, top_p=0.9)] * num_seqs))
+        ps = self.parallel
+        # Later pipeline stages start from hidden states instead of token ids; stages run their own
+        # layers here with no communication between them (tensor-parallel ranks all-reduce as usual).
+        hidden_in = None if ps.is_first_stage else torch.zeros(num_tokens, self.hidden_size, dtype=self.dtype, device=device)
+        hidden = self.model(input_ids, positions, _ProfileAttention(lens), hidden_in) if ps.distributed else \
+            self.model(input_ids, positions, _ProfileAttention(lens))
+        logits = None
+        if ps.is_last_stage:
+            logits = self.model.compute_logits(hidden[:num_seqs])
+            if ps.rank == ps.sampler_rank:
+                full = logits if ps.tp_size == 1 else torch.zeros(
+                    num_seqs, self.vocab_size, dtype=logits.dtype, device=device
+                )  # stands in for the vocab-gathered logits
+                sampler(full, sampler.prepare([SamplingParams(temperature=1.0, top_p=0.9)] * num_seqs))
         torch.cuda.synchronize(device)
 
         peak = torch.cuda.max_memory_allocated(device)

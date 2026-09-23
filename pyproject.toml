@@ -33,4 +33,5 @@ markers = [
     "model: needs the Qwen3-0.6B-Base weights",
     "slow: takes more than about 30 seconds on CPU",
     "gpu: needs CUDA (and FlashInfer where noted)",
+    "distributed: runs several processes (gloo on CPU, NCCL on GPU)",
 ]

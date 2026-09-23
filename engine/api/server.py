@@ -8,6 +8,10 @@ between steps so handlers can run; handlers reach it only through queues. The se
 127.0.0.1 by default: this is an unauthenticated endpoint and belongs on localhost.
 
     python -m engine.api.server --model Qwen/Qwen3-0.6B-Base --port 8000
+
+Split across GPUs, launch every rank with torchrun; rank 0 serves HTTP and the rest become workers:
+
+    torchrun --nproc-per-node 2 -m engine.api.server --tensor-parallel-size 2
 """
 
 from __future__ import annotations
@@ -278,9 +282,27 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--log-level", default="info")
     args = parser.parse_args(argv)
     logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    engine = LLMEngine(EngineConfig.from_cli_args(args))
+    config = EngineConfig.from_cli_args(args)
+    parallel = None
+    if config.world_size > 1:
+        from engine.distributed.parallel import init_parallel, shutdown_parallel
+        from engine.distributed.worker import device_type, run_worker
+
+        parallel = init_parallel(config.tensor_parallel_size, config.pipeline_parallel_size, device_type(config))
+        if not parallel.is_driver:
+            try:
+                run_worker(config, parallel)
+            finally:
+                shutdown_parallel()
+            return
+    engine = LLMEngine(config, parallel=parallel)
     app = build_app(engine, args.served_model_name or args.model)
-    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level, access_log=False)
+    try:
+        uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level, access_log=False)
+    finally:
+        engine.shutdown()
+        if parallel is not None:
+            shutdown_parallel()
 
 
 if __name__ == "__main__":

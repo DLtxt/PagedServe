@@ -40,6 +40,10 @@ class EngineConfig:
     admission_policy: str = _opt("fcfs", "fcfs | sjf | priority")
     aging_rate: float = _opt(100.0, "priority policy: priority units (tokens) gained per second of waiting")
 
+    # Parallelism: tensor_parallel_size * pipeline_parallel_size processes, one per GPU
+    tensor_parallel_size: int = _opt(1, "GPUs each layer is split across (tensor parallelism)")
+    pipeline_parallel_size: int = _opt(1, "stages the layers are split into, each on its own GPU(s) (pipeline parallelism)")
+
     # Execution
     attention_backend: str = _opt("auto", "auto | naive | flashinfer (auto: flashinfer on cuda, naive elsewhere)")
     cuda_graphs: bool = _opt(False, "capture decode-only batches in CUDA graphs (flashinfer backend only)")
@@ -60,6 +64,8 @@ class EngineConfig:
         _check(self.preemption_mode in ("recompute", "swap"), "preemption_mode must be recompute or swap")
         _check(self.admission_policy in ("fcfs", "sjf", "priority"), "admission_policy must be fcfs, sjf or priority")
         _check(self.aging_rate >= 0, "aging_rate must be non-negative")
+        _check(self.tensor_parallel_size >= 1, "tensor_parallel_size must be at least 1")
+        _check(self.pipeline_parallel_size >= 1, "pipeline_parallel_size must be at least 1")
         _check(self.attention_backend in ("auto", "naive", "flashinfer"), "attention_backend must be auto, naive or flashinfer")
         _check(self.dtype in ("auto", "float32", "bfloat16", "float16"), "dtype must be auto, float32, bfloat16 or float16")
         _check(
@@ -70,6 +76,10 @@ class EngineConfig:
     @property
     def is_cuda(self) -> bool:
         return self.device.startswith("cuda")
+
+    @property
+    def world_size(self) -> int:
+        return self.tensor_parallel_size * self.pipeline_parallel_size
 
     @property
     def torch_dtype(self) -> torch.dtype:
@@ -93,6 +103,10 @@ class EngineConfig:
         _check(
             not self.cuda_graphs or (self.is_cuda and self.attention_backend == "flashinfer"),
             "cuda_graphs needs CUDA and the flashinfer backend",
+        )
+        _check(
+            not (self.cuda_graphs and self.world_size > 1),
+            "cuda_graphs is single-GPU for now; run tensor or pipeline parallelism without it",
         )
         _check(self.num_blocks is not None or self.is_cuda, "num_blocks must be set when not running on CUDA")
 
