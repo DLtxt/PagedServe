@@ -4,9 +4,6 @@ A single-GPU LLM inference engine: paged KV-cache memory management, iteration-l
 batching, prefix caching, chunked prefill, recompute and swap preemption, and a streaming
 OpenAI-compatible HTTP API. It serves `Qwen/Qwen3-0.6B-Base`.
 
-This is a reimplementation of the core mechanics behind vLLM, built to learn them. vLLM and nano-vLLM
-exist and are the real thing.
-
 ## Status
 
 | Part | State |
