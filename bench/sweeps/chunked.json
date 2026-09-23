@@ -1,0 +1,56 @@
+{
+  "_comment": "Chunked prefill on/off across prompt-length mixes: a steady stream of short requests with a long prompt (1,000 / 2,000 / 4,000 tokens) every 5 s. The 4,000-token run is the money plot. Workloads carry their own arrival times; the rate is only a file label.",
+  "workload": "bench/data/long_mix_L4000.jsonl",
+  "rates": [
+    1
+  ],
+  "save_tokens": true,
+  "server_args": [
+    "--max-model-len",
+    "8192"
+  ],
+  "configs": [
+    {
+      "label": "unchunked-L1000",
+      "workload": "bench/data/long_mix_L1000.jsonl",
+      "args": []
+    },
+    {
+      "label": "chunked-L1000",
+      "workload": "bench/data/long_mix_L1000.jsonl",
+      "args": [
+        "--enable-chunked-prefill",
+        "--max-batch-tokens",
+        "2048"
+      ]
+    },
+    {
+      "label": "unchunked-L2000",
+      "workload": "bench/data/long_mix_L2000.jsonl",
+      "args": []
+    },
+    {
+      "label": "chunked-L2000",
+      "workload": "bench/data/long_mix_L2000.jsonl",
+      "args": [
+        "--enable-chunked-prefill",
+        "--max-batch-tokens",
+        "2048"
+      ]
+    },
+    {
+      "label": "unchunked-L4000",
+      "workload": "bench/data/long_mix_L4000.jsonl",
+      "args": []
+    },
+    {
+      "label": "chunked-L4000",
+      "workload": "bench/data/long_mix_L4000.jsonl",
+      "args": [
+        "--enable-chunked-prefill",
+        "--max-batch-tokens",
+        "2048"
+      ]
+    }
+  ]
+}

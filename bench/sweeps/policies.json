@@ -1,0 +1,12 @@
+{
+  "_comment": "Admission policies on identical traffic, prefill-priority scheduling. FCFS head-of-line blocks, SJF starves long prompts, priority = SJF with aging bounds the starvation. Run near and past saturation, where the queue is where the policy matters.",
+  "workload": "bench/data/sharegpt.jsonl",
+  "rates": [16, 32],
+  "duration": 90,
+  "server_args": ["--max-model-len", "4096"],
+  "configs": [
+    {"label": "fcfs", "args": ["--admission-policy", "fcfs"]},
+    {"label": "sjf", "args": ["--admission-policy", "sjf"]},
+    {"label": "priority", "args": ["--admission-policy", "priority", "--aging-rate", "100"]}
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "_comment": "Latency vs throughput: this engine's full configuration across request rates. vLLM and the HF baseline replay the same workload from scripts/gpu_suite.sh.",
+  "workload": "bench/data/sharegpt.jsonl",
+  "rates": [1, 2, 4, 8, 16, 24, 32, 48, 64],
+  "duration": 60,
+  "server_args": ["--max-model-len", "4096"],
+  "configs": [
+    {"label": "ours", "args": ["--enable-chunked-prefill", "--max-batch-tokens", "2048", "--enable-prefix-caching", "--cuda-graphs"]}
+  ]
+}

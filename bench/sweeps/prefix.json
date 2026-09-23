@@ -1,0 +1,89 @@
+{
+  "_comment": "Prefix caching, honestly: TTFT against shared-prefix length, cache on and off, on identical traffic (a shared system prompt of L tokens plus a 16-64 token unique suffix per request).",
+  "workload": "bench/data/prefix_L512.jsonl",
+  "rates": [
+    8
+  ],
+  "duration": 60,
+  "server_args": [
+    "--max-model-len",
+    "4096",
+    "--enable-chunked-prefill",
+    "--max-batch-tokens",
+    "2048"
+  ],
+  "configs": [
+    {
+      "label": "cache-on-L0",
+      "workload": "bench/data/prefix_L0.jsonl",
+      "args": [
+        "--enable-prefix-caching"
+      ]
+    },
+    {
+      "label": "cache-off-L0",
+      "workload": "bench/data/prefix_L0.jsonl",
+      "args": []
+    },
+    {
+      "label": "cache-on-L128",
+      "workload": "bench/data/prefix_L128.jsonl",
+      "args": [
+        "--enable-prefix-caching"
+      ]
+    },
+    {
+      "label": "cache-off-L128",
+      "workload": "bench/data/prefix_L128.jsonl",
+      "args": []
+    },
+    {
+      "label": "cache-on-L256",
+      "workload": "bench/data/prefix_L256.jsonl",
+      "args": [
+        "--enable-prefix-caching"
+      ]
+    },
+    {
+      "label": "cache-off-L256",
+      "workload": "bench/data/prefix_L256.jsonl",
+      "args": []
+    },
+    {
+      "label": "cache-on-L512",
+      "workload": "bench/data/prefix_L512.jsonl",
+      "args": [
+        "--enable-prefix-caching"
+      ]
+    },
+    {
+      "label": "cache-off-L512",
+      "workload": "bench/data/prefix_L512.jsonl",
+      "args": []
+    },
+    {
+      "label": "cache-on-L1024",
+      "workload": "bench/data/prefix_L1024.jsonl",
+      "args": [
+        "--enable-prefix-caching"
+      ]
+    },
+    {
+      "label": "cache-off-L1024",
+      "workload": "bench/data/prefix_L1024.jsonl",
+      "args": []
+    },
+    {
+      "label": "cache-on-L2048",
+      "workload": "bench/data/prefix_L2048.jsonl",
+      "args": [
+        "--enable-prefix-caching"
+      ]
+    },
+    {
+      "label": "cache-off-L2048",
+      "workload": "bench/data/prefix_L2048.jsonl",
+      "args": []
+    }
+  ]
+}

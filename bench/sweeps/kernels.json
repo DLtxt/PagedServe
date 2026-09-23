@@ -1,0 +1,12 @@
+{
+  "_comment": "What each fast path buys, at saturation (all requests at once): the naive paged oracle, FlashInfer, and FlashInfer with CUDA graphs.",
+  "workload": "bench/data/sharegpt.jsonl",
+  "rates": ["inf"],
+  "num_requests": 400,
+  "server_args": ["--max-model-len", "4096", "--enable-chunked-prefill", "--max-batch-tokens", "2048"],
+  "configs": [
+    {"label": "naive", "args": ["--attention-backend", "naive"]},
+    {"label": "flashinfer", "args": ["--attention-backend", "flashinfer"]},
+    {"label": "flashinfer-graphs", "args": ["--attention-backend", "flashinfer", "--cuda-graphs"]}
+  ]
+}

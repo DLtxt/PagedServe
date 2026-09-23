@@ -1,0 +1,12 @@
+{
+  "_comment": "Block size is the page size: smaller wastes less of each sequence's last block but means longer block tables and more gathering.",
+  "workload": "bench/data/sharegpt.jsonl",
+  "rates": [8, 16, 32],
+  "duration": 60,
+  "server_args": ["--max-model-len", "4096", "--enable-chunked-prefill", "--max-batch-tokens", "2048"],
+  "configs": [
+    {"label": "bs8", "args": ["--block-size", "8"]},
+    {"label": "bs16", "args": ["--block-size", "16"]},
+    {"label": "bs32", "args": ["--block-size", "32"]}
+  ]
+}

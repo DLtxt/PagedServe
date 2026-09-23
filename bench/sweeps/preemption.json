@@ -1,0 +1,11 @@
+{
+  "_comment": "Recompute vs swap end to end: a deliberately small KV cache (800 blocks = 12,800 tokens) forces preemption under load.",
+  "workload": "bench/data/long_outputs.jsonl",
+  "rates": [2, 4, 8],
+  "duration": 60,
+  "server_args": ["--max-model-len", "4096", "--num-blocks", "800", "--swap-space-gb", "8"],
+  "configs": [
+    {"label": "recompute", "args": ["--preemption-mode", "recompute"]},
+    {"label": "swap", "args": ["--preemption-mode", "swap"]}
+  ]
+}
