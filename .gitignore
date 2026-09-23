@@ -1,0 +1,67 @@
+# --- Secrets & credentials: never commit these ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+.netrc
+.pypirc
+.git-credentials
+credentials*.json
+service-account*.json
+secrets/
+*.secret
+hf_token*
+.huggingface/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# --- Tooling caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.ipynb_checkpoints/
+.cache/
+
+# --- Model weights, datasets, large artifacts ---
+models/
+weights/
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+bench/data/
+
+# --- Profiler traces & logs ---
+*.trace.json
+profiles/
+logs/
+*.log
+
+# --- OS / editors ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# --- Claude Code per-user settings ---
+.claude/settings.local.json
