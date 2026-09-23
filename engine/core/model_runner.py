@@ -198,13 +198,22 @@ class ModelRunner:
         peak = torch.cuda.max_memory_allocated(device)
         free, total = torch.cuda.mem_get_info(device)
         non_torch = (total - free) - torch.cuda.memory_reserved(device)
-        budget = total * cfg.gpu_memory_utilization - peak - non_torch
+        # Allocated after this profile, so reserve them explicitly: FlashInfer's workspace, and the
+        # private memory pool the captured decode graphs keep their activations in.
+        later = 0
+        if cfg.attention_backend == "flashinfer":
+            from engine.model.attention import FlashInferAttention
+
+            later += FlashInferAttention.WORKSPACE_BYTES
+        if cfg.cuda_graphs:
+            later += 512 << 20
+        budget = total * cfg.gpu_memory_utilization - peak - non_torch - later
         num_blocks = int(budget // self.bytes_per_block)
         gib = 1 << 30
         logger.info(
-            "memory profile: total %.2f GiB, peak torch %.2f GiB, non-torch %.2f GiB, KV budget %.2f GiB "
-            "-> %d blocks of %d tokens (%.1f MiB each, %d tokens total)",
-            total / gib, peak / gib, non_torch / gib, budget / gib, num_blocks, self.block_size,
+            "memory profile: total %.2f GiB, peak torch %.2f GiB, non-torch %.2f GiB, reserved %.2f GiB, "
+            "KV budget %.2f GiB -> %d blocks of %d tokens (%.1f MiB each, %d tokens total)",
+            total / gib, peak / gib, non_torch / gib, later / gib, budget / gib, num_blocks, self.block_size,
             self.bytes_per_block / (1 << 20), num_blocks * self.block_size,
         )
         del hidden, logits

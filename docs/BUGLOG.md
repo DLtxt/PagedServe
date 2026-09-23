@@ -46,6 +46,13 @@ decoding at real-model speed.
 
 ## Found in review of my own code
 
+**The fp32 gates would have crashed on the GPU.** Reviewing the CUDA paths before handing them over:
+every engine test builds its engine in fp32 with `attention_backend="auto"`, and on CUDA "auto" meant
+FlashInfer, whose kernels exist only for fp16 and bf16. Gates 3 through 8 pass on a Mac, where "auto"
+means the naive backend, and would have failed at the first FlashInfer call on the GPU box. Fix:
+"auto" picks FlashInfer only for fp16/bf16 on CUDA, and asking for FlashInfer in fp32 is a config
+error rather than a kernel crash.
+
 **An `assert` with a side effect.** `_pop_waiting` was written as `assert self.waiting.pop() is seq`.
 Under `python -O` asserts are stripped, the pop never happens, and the same request would be admitted
 over and over. Fix: pop first, assert on the result.

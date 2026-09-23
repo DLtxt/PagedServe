@@ -34,9 +34,9 @@ def next_token(history: list[int], vocab_size: int) -> int:
 
 
 class ToyModel(nn.Module):
-    def __init__(self, config: ToyConfig = ToyConfig()) -> None:
+    def __init__(self, config: ToyConfig | None = None) -> None:
         super().__init__()
-        self.config = config
+        self.config = config or ToyConfig()
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, attn) -> torch.Tensor:
         t = input_ids.shape[0]

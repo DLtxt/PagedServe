@@ -83,8 +83,13 @@ class EngineConfig:
         if self.dtype == "auto":
             self.dtype = "bfloat16" if self.is_cuda else "float32"
         if self.attention_backend == "auto":
-            self.attention_backend = "flashinfer" if self.is_cuda else "naive"
+            # FlashInfer's kernels are fp16/bf16 only; fp32 (the exact-match gates) takes the naive path.
+            self.attention_backend = "flashinfer" if self.is_cuda and self.dtype != "float32" else "naive"
         _check(not (self.attention_backend == "flashinfer" and not self.is_cuda), "the flashinfer backend needs CUDA")
+        _check(
+            not (self.attention_backend == "flashinfer" and self.dtype == "float32"),
+            "the flashinfer backend needs float16 or bfloat16",
+        )
         _check(
             not self.cuda_graphs or (self.is_cuda and self.attention_backend == "flashinfer"),
             "cuda_graphs needs CUDA and the flashinfer backend",
