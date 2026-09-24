@@ -219,8 +219,9 @@ class BlockManager:
         for seq in gpu_seqs:
             table = seq.block_table
             assert len(set(table)) == len(table), f"seq {seq.seq_id} maps a block twice: {table}"
-            assert len(table) == self.blocks_for(seq.num_computed_tokens), (
-                f"seq {seq.seq_id}: {len(table)} blocks for {seq.num_computed_tokens} computed tokens"
+            covered = seq.num_computed_tokens + seq.in_flight_tokens  # a batch in flight already has its slots
+            assert len(table) == self.blocks_for(covered), (
+                f"seq {seq.seq_id}: {len(table)} blocks for {covered} computed or in-flight tokens"
             )
             counts.update(table)
         for block in range(self.num_blocks):

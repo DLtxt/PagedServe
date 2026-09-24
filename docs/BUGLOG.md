@@ -105,3 +105,60 @@ hits and the next block has the same tokens as a block cached under a different 
 builds exactly that (B = X + M, where X is shared with request C and M's cached copy sits after A's Z).
 With the planted bug, B reuses 32 cached tokens instead of 16 and its first-step logits are off by 1.0:
 plausible-looking, wrong output, the failure the plan warns about.
+
+## Found building tensor and pipeline parallelism
+
+**Two planted sharding bugs survived because the tiny model made them no-ops.** Mutation testing the
+split model planted nine bugs one at a time: no all-reduce after o_proj, none after down_proj, a
+vocabulary-parallel embedding without its mask, k/v sliced like q, o_proj sliced by rows, zeros sent
+between stages, every stage running layers 0 to n, swap-in copies dropped from the plan, and logit
+shards gathered in reverse. Seven were caught. The other two were equivalent mutants for the test
+model: with twice as many query heads as KV heads, half of each rank's q slice is exactly its kv
+slice, and with a hidden size of 64, rows 0 to 64 of o_proj are the whole matrix. Planted again as
+real bugs (each rank taking the other rank's k heads, the other rank's o_proj columns, or down_proj's
+columns reversed), all three were caught.
+
+**Aborting a sequence in flight would have handed its token to its neighbour.** Found in review of the
+pipelining patch, before it ran. With several batches in flight, aborting a sequence has to wait for
+its batch to come back, and the draft dropped the sequence in `update()` before taking its sampled
+token from the step's token list. Every later sequence in that batch would have received the token
+meant for the one before it: fluent, wrong text, and no crash. Fix: take the token, then drop the
+sequence. `test_abort_in_flight_waits_for_its_batch_and_keeps_tokens_aligned` fails on the draft's
+order, and so does the randomized stress at depth 2.
+
+**Without balancing, the pipeline would never have filled.** Also found in review before running. A
+sequence in flight is not scheduled again, so sequences that return together are scheduled together,
+and a burst admitted in one batch would travel as one batch for good: stage 0 idle while stage 1
+works, the bubble pipelining exists to remove, with every output still correct, so no correctness test
+would have noticed. Fix: each batch takes at most its share of the running sequences. A test asserts
+that eight sequences admitted together run as two batches of four, and every pipelined distributed
+test asserts the pipeline really held `pipeline_depth` batches.
+
+**A pipeline stage could overwrite FlashInfer's plan before its GPU had read it.** The pipelining draft
+had this race; it was found by reading FlashInfer's source against the pipelined timeline and has not
+been observed, since it needs a GPU. FlashInfer 0.7.0's `plan()` writes into one pinned buffer per
+wrapper and copies it to the GPU with `cudaMemcpyAsync` (`attention/scheduler.cuh`). On one GPU that is
+safe because sampling syncs every step, but a pipeline stage that does not sample can plan step k+1
+before its GPU has executed step k's copy. Fix: the runner records an event after each plan and waits
+on it before the next.
+
+**Stopping a distributed server hung for 30 seconds, then killed the driver.** Found by the first
+smoke run of a benchmark sweep under torchrun: every configuration's server took exactly 30 seconds to
+stop, and its log ended in a worker's KeyboardInterrupt and torchrun's "forcefully exiting via 9".
+Dumping the driver's stack during the hang put it in the shutdown path, waiting to send the shutdown
+plan. torchrun forwards SIGINT to every rank (a Ctrl-C in a terminal reaches them all anyway), so the
+worker died of the signal inside its wait for the next plan, while the driver, whose HTTP server shuts
+down gracefully, then sent the shutdown plan to a dead peer; gloo never noticed, and the driver waited
+until torchrun SIGKILLed it. The bug predates pipelining: the broadcast version would have hung the
+same way. Fix: workers ignore SIGINT and SIGTERM, since their lifetime is the driver's (it stops them
+once the batches in flight have drained, and torchrun kills them if the driver dies), and the driver
+waits at most 30 seconds on the shutdown send. The torchrun server test now asserts every rank stops
+within 20 seconds of a SIGINT with no rank dying of it; the whole shutdown takes about a second.
+
+**A planted pipelining bug that only a direct check can see.** Mutation testing the pipelined scheduler
+planted ten bugs; nine were caught at once. The tenth, letting the engine keep one more batch in flight
+than `pipeline_depth`, passed everything, because it is harmless to correctness. The stress test now
+asserts the bound at every submission and catches it. One catch was for the wrong reason: the first
+version of the token-order mutant deleted the token read instead of moving it, so the tests failed on
+a NameError, not on the bug. Planted faithfully, it is caught by the dedicated abort test and by the
+stress test on its own.

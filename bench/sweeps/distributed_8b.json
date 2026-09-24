@@ -1,0 +1,15 @@
+{
+  "_comment": "Qwen3-8B split across two GPUs: one GPU, tensor parallel, pipeline parallel with two batches in flight, and pipeline parallel one batch at a time (what pipelining buys). No CUDA graphs anywhere, since they are single-GPU for now, so the layouts compare like for like. scripts/gpu_suite.sh adds vLLM at tensor parallel 2 on the same traffic.",
+  "model": "Qwen/Qwen3-8B-Base",
+  "workload": "bench/data/sharegpt.jsonl",
+  "rates": [1, 2, 4, 8, 12, 16],
+  "duration": 45,
+  "server_args": ["--model", "Qwen/Qwen3-8B-Base", "--max-model-len", "4096", "--enable-chunked-prefill",
+                  "--max-batch-tokens", "2048", "--enable-prefix-caching"],
+  "configs": [
+    {"label": "tp1", "args": []},
+    {"label": "tp2", "args": ["--tensor-parallel-size", "2"]},
+    {"label": "pp2", "args": ["--pipeline-parallel-size", "2"]},
+    {"label": "pp2-depth1", "args": ["--pipeline-parallel-size", "2", "--pipeline-depth", "1"]}
+  ]
+}

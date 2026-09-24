@@ -3,7 +3,7 @@
 LocalExecutor is the single-process path: forward, sample, done. DistributedExecutor runs on the
 driver (rank 0) when the model is split across processes:
 
-  1. encode the batch as a compact plan and broadcast it to every rank (control plane, gloo);
+  1. encode the batch as a compact plan and send it to every rank (control plane, gloo);
   2. every rank runs its share of the forward pass through the unchanged ModelRunner: pipeline stages
      pass hidden states down the line, tensor-parallel ranks all-reduce inside each layer;
   3. the last stage gathers the vocab-split logits onto its tp rank 0, which samples;
@@ -11,12 +11,18 @@ driver (rank 0) when the model is split across processes:
 
 Workers (every other rank) sit in worker_loop, turning plans back into lightweight batch views that
 look to the ModelRunner exactly like a ScheduledBatch.
+
+submit() returns once the driver's own share of the step is launched and wait() collects the tokens,
+so under pipeline parallelism the engine keeps several batches in flight: stage 0 runs batch k+1
+while stage 1 is still on batch k. Every rank executes plans in the order they were sent, which is
+what keeps each stage's KV cache consistent with the scheduler's view.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import timedelta
 
 import numpy as np
 import torch
@@ -25,15 +31,17 @@ from engine.core.sampler import Sampler
 from engine.core.sequence import SamplingParams
 from engine.distributed.parallel import (
     ParallelState,
-    broadcast_ints,
-    recv_ints_on_driver,
-    send_ints_to_driver,
+    irecv_result,
+    isend_result,
+    recv_plan,
+    send_plan,
     tp_gather_last_dim,
 )
 
 logger = logging.getLogger(__name__)
 
 STEP, SHUTDOWN = 1, 2
+_SHUTDOWN_TIMEOUT = timedelta(seconds=30)  # workers first finish the batches in flight
 _HEADER = 8  # cmd, num_seqs, num_new_tokens, num_pages, num_swap_out, num_swap_in, num_sampling, debug_topk
 
 
@@ -55,8 +63,24 @@ class LocalExecutor:
         tokens = self.sampler(logits, sampling) if logits is not None else []
         return StepResult(tokens, logits=logits)
 
+    def submit(self, batch) -> StepResult:  # one process: nothing to overlap, so run it now
+        return self.execute(batch)
+
+    def wait(self, handle: StepResult) -> StepResult:
+        return handle
+
     def shutdown(self) -> None:
         pass
+
+
+@dataclass
+class _Pending:
+    """A submitted step: its result, or the receive it will arrive on."""
+
+    num_sampling: int
+    debug_topk: int
+    local: StepResult | None = None  # the result, when the driver is the sampling rank
+    recv: tuple | None = None  # (work, buffer): the result on its way from the sampling rank
 
 
 class DistributedExecutor:
@@ -67,48 +91,68 @@ class DistributedExecutor:
         self.block_size = block_size
         self.debug_topk = 0  # > 0: the sampling rank also returns each row's top-k logits
         self._closed = False
+        self._sends: list[tuple] = []  # plan sends in progress
+
+    def submit(self, batch) -> _Pending:
+        ps, k = self.parallel, self.debug_topk
+        self._sends = [h for h in self._sends if not h[0].is_completed()]
+        self._sends += send_plan(ps, encode_plan(batch, self.block_size, k))
+        n = len(batch.sampling_params)
+        pending = _Pending(n, k)
+        if n and ps.sampler_rank != 0:
+            pending.recv = irecv_result(ps, n * (1 + 2 * k), ps.sampler_rank)
+        pending.local = run_step(ps, self.runner, self.sampler, batch, batch.sampling_params, k)
+        return pending
+
+    def wait(self, pending: _Pending) -> StepResult:
+        if pending.recv is not None:
+            work, buf = pending.recv
+            work.wait()
+            return _unpack_result(buf, pending.num_sampling, pending.debug_topk)
+        return pending.local or StepResult([])
 
     def execute(self, batch) -> StepResult:
-        broadcast_ints(self.parallel, encode_plan(batch, self.block_size, self.debug_topk))
-        return run_step(self.parallel, self.runner, self.sampler, batch, batch.sampling_params, self.debug_topk)
+        return self.wait(self.submit(batch))
 
     def shutdown(self) -> None:
+        """Stop the workers. They finish any plans already sent first, so this also drains batches
+        still in flight."""
         if self._closed:
             return
         self._closed = True
         try:
-            broadcast_ints(self.parallel, torch.tensor([SHUTDOWN] + [0] * (_HEADER - 1), dtype=torch.int64))
+            for work, _ in send_plan(self.parallel, torch.tensor([SHUTDOWN] + [0] * (_HEADER - 1), dtype=torch.int64)):
+                work.wait(_SHUTDOWN_TIMEOUT)  # gloo does not notice a dead peer; don't wait on one forever
+            self.runner.flush_sends()
         except Exception as exc:  # workers already gone (e.g. torchrun tearing everything down)
             logger.warning("could not signal workers to stop: %r", exc)
 
 
 def run_step(ps: ParallelState, runner, sampler: Sampler, batch, sampling_params: list, debug_topk: int) -> StepResult | None:
-    """One rank's part of one step. Returns the result on the driver, None elsewhere."""
+    """One rank's part of one step. The sampling rank returns the result, and sends it to the
+    driver if it is another process; every other rank returns None."""
     logits = runner.execute(batch)  # this rank's stage; forwards hidden states unless it is the last
     n = len(sampling_params)
-    result = None
-    if ps.is_last_stage and n:
-        full = tp_gather_last_dim(ps, logits)  # [n, vocab] on tp rank 0 of the last stage
-        if ps.tp_rank == 0:
-            tokens = sampler(full, sampler.prepare(sampling_params))
-            topk = full.float().topk(debug_topk) if debug_topk else None
-            result = StepResult(tokens, logits=full if ps.is_driver else None,
-                                topk=(topk.indices.cpu(), topk.values.cpu()) if topk is not None else None)
-    if n and ps.sampler_rank != 0:  # the sampling rank is on another process: ship the result back
-        if ps.rank == ps.sampler_rank:
-            send_ints_to_driver(ps, _pack_result(result, debug_topk))
-        elif ps.is_driver:
-            result = _unpack_result(recv_ints_on_driver(ps, n * (1 + 2 * debug_topk), ps.sampler_rank), n, debug_topk)
-    if ps.is_driver and result is None:
-        result = StepResult([])
-    return result if ps.is_driver else None
+    if not (ps.is_last_stage and n):
+        return None
+    full = tp_gather_last_dim(ps, logits)  # [n, vocab] on tp rank 0 of the last stage
+    if ps.tp_rank != 0:
+        return None
+    tokens = sampler(full, sampler.prepare(sampling_params))
+    topk = full.float().topk(debug_topk) if debug_topk else None
+    result = StepResult(tokens, logits=full if ps.is_driver else None,
+                        topk=(topk.indices.cpu(), topk.values.cpu()) if topk is not None else None)
+    if not ps.is_driver:
+        runner.track_send(isend_result(ps, _pack_result(result, debug_topk)))
+    return result
 
 
 def worker_loop(ps: ParallelState, runner, sampler: Sampler, block_size: int) -> None:
-    """Every non-driver rank: execute plans until the driver says stop."""
+    """Every non-driver rank: execute plans, in order, until the driver says stop."""
     while True:
-        plan = broadcast_ints(ps, None)
+        plan = recv_plan(ps)
         if int(plan[0]) == SHUTDOWN:
+            runner.flush_sends()
             return
         batch, sampling_params, debug_topk = decode_plan(plan)
         run_step(ps, runner, sampler, batch, sampling_params, debug_topk)

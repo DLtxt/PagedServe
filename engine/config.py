@@ -43,6 +43,7 @@ class EngineConfig:
     # Parallelism: tensor_parallel_size * pipeline_parallel_size processes, one per GPU
     tensor_parallel_size: int = _opt(1, "GPUs each layer is split across (tensor parallelism)")
     pipeline_parallel_size: int = _opt(1, "stages the layers are split into, each on its own GPU(s) (pipeline parallelism)")
+    pipeline_depth: int | None = _opt(None, "batches in flight at once; default pipeline_parallel_size (1: one at a time)")
 
     # Execution
     attention_backend: str = _opt("auto", "auto | naive | flashinfer (auto: flashinfer on cuda, naive elsewhere)")
@@ -66,6 +67,7 @@ class EngineConfig:
         _check(self.aging_rate >= 0, "aging_rate must be non-negative")
         _check(self.tensor_parallel_size >= 1, "tensor_parallel_size must be at least 1")
         _check(self.pipeline_parallel_size >= 1, "pipeline_parallel_size must be at least 1")
+        _check(self.pipeline_depth is None or self.pipeline_depth >= 1, "pipeline_depth must be at least 1")
         _check(self.attention_backend in ("auto", "naive", "flashinfer"), "attention_backend must be auto, naive or flashinfer")
         _check(self.dtype in ("auto", "float32", "bfloat16", "float16"), "dtype must be auto, float32, bfloat16 or float16")
         _check(
@@ -109,6 +111,11 @@ class EngineConfig:
             "cuda_graphs is single-GPU for now; run tensor or pipeline parallelism without it",
         )
         _check(self.num_blocks is not None or self.is_cuda, "num_blocks must be set when not running on CUDA")
+        if self.pipeline_depth is None:
+            self.pipeline_depth = self.pipeline_parallel_size
+        elif self.pipeline_depth > 1 and self.pipeline_parallel_size == 1:
+            logger.warning("pipeline_depth %d without pipeline parallelism overlaps nothing; batches only get smaller",
+                           self.pipeline_depth)
 
         if self.max_model_len is None:
             self.max_model_len = model_max_len

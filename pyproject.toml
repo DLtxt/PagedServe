@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pagedserve"
 version = "0.1.0"
-description = "Single-GPU LLM inference engine: paged KV cache, continuous batching, prefix caching, chunked prefill"
+description = "LLM inference engine: paged KV cache, continuous batching, prefix caching, chunked prefill, tensor and pipeline parallelism"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

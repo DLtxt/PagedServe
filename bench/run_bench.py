@@ -12,6 +12,9 @@ same client drives this engine and vLLM, so both are measured on identical traff
 
     # launch this engine once per configuration and run every rate against each
     python -m bench.run_bench sweep --spec bench/sweeps/policies.json --out bench/results/policies
+
+A configuration whose arguments ask for tensor or pipeline parallelism is launched under torchrun,
+one process per GPU on this machine.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ import json
 import math
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -226,6 +230,26 @@ def _wait_healthy(base: str, proc: subprocess.Popen, timeout: float) -> None:
     raise TimeoutError("server did not become healthy")
 
 
+def _world_size(args: list[str]) -> int:
+    size = 1
+    for flag in ("--tensor-parallel-size", "--pipeline-parallel-size"):
+        if flag in args:
+            size *= int(args[args.index(flag) + 1])
+    return size
+
+
+def _server_command(args: list[str]) -> list[str]:
+    """This engine's server, under torchrun when the arguments split the model across GPUs."""
+    world = _world_size(args)
+    if world == 1:
+        return [sys.executable, "-m", "engine.api.server", *args]
+    with socket.socket() as s:  # the ranks' rendezvous, on loopback
+        s.bind(("127.0.0.1", 0))
+        master_port = s.getsockname()[1]
+    return [sys.executable, "-m", "torch.distributed.run", "--nproc-per-node", str(world), "--master-addr", "127.0.0.1",
+            "--master-port", str(master_port), "-m", "engine.api.server", *args]
+
+
 def sweep(spec_path: str, out: Path, port: int) -> None:
     """Launch this engine once per configuration in the spec and run every rate against it."""
     spec = json.loads(Path(spec_path).read_text())
@@ -233,8 +257,8 @@ def sweep(spec_path: str, out: Path, port: int) -> None:
     base = f"http://127.0.0.1:{port}"
     for config in spec["configs"]:
         label = config["label"]
-        cmd = [sys.executable, "-m", "engine.api.server", "--port", str(port), "--log-level", "warning",
-               "--step-log", str(out / f"{label}_steps.csv"), *spec.get("server_args", []), *config.get("args", [])]
+        cmd = _server_command(["--port", str(port), "--log-level", "warning", "--step-log", str(out / f"{label}_steps.csv"),
+                               *spec.get("server_args", []), *config.get("args", [])])
         print(f"[{label}] launching: {' '.join(cmd)}", flush=True)
         with open(out / f"{label}_server.log", "w") as log:
             proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)

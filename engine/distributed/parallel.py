@@ -10,8 +10,13 @@ Two kinds of traffic:
   data plane     the work itself. Tensor parallelism all-reduces inside every layer and gathers the
                  vocab-split logits; pipeline parallelism sends hidden states from stage to stage.
                  NCCL on GPUs, gloo on CPUs.
-  control plane  the driver broadcasting each step's plan to every rank, and the sampled tokens
-                 coming back. Always gloo on CPU tensors, so reading a plan never costs a GPU sync.
+  control plane  the driver sending each step's plan to every rank, and the sampled tokens coming
+                 back. Always gloo on CPU tensors, so reading a plan never costs a GPU sync.
+
+Plans travel point to point, not by broadcast: a broadcast is a collective every rank enters
+together, so the driver could not hand stage 0 its next batch before the last stage had finished the
+current one, and a pipeline could never hold two batches. Sends are non-blocking; each kind of
+message has its own tag, and every rank receives each kind in the order it was sent.
 """
 
 from __future__ import annotations
@@ -70,6 +75,8 @@ class ParallelState:
 
 SINGLE = ParallelState()
 
+PLAN_TAG, HIDDEN_TAG, RESULT_TAG = 1, 2, 3
+
 
 def layer_range(num_layers: int, pp_size: int, pp_rank: int) -> tuple[int, int]:
     """The contiguous block of layers a pipeline stage owns; earlier stages take any remainder."""
@@ -125,8 +132,13 @@ def init_parallel(
 
 
 def shutdown_parallel() -> None:
-    if dist.is_initialized():
-        dist.destroy_process_group()
+    if not dist.is_initialized():
+        return
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        # NCCL sends and receives return before the GPU runs them; a stage that never samples may still
+        # have its last hidden-state transfer in flight. Tearing the communicators down under it can hang.
+        torch.cuda.synchronize()
+    dist.destroy_process_group()
 
 
 # --- data plane ----------------------------------------------------------------------------------
@@ -148,13 +160,15 @@ def tp_gather_last_dim(ps: ParallelState, x: torch.Tensor) -> torch.Tensor | Non
     return torch.cat(parts, dim=-1) if parts is not None else None
 
 
-def send_to_next_stage(ps: ParallelState, x: torch.Tensor) -> None:
-    dist.send(x.contiguous(), dst=ps.global_rank(ps.pp_rank + 1, ps.tp_rank))
+def isend_to_next_stage(ps: ParallelState, x: torch.Tensor) -> tuple:
+    """Returns (work, tensor): the tensor must stay alive until the work completes."""
+    x = x.contiguous()
+    return dist.isend(x, dst=ps.global_rank(ps.pp_rank + 1, ps.tp_rank), tag=HIDDEN_TAG), x
 
 
 def recv_from_prev_stage(ps: ParallelState, shape: tuple[int, ...], dtype: torch.dtype, device) -> torch.Tensor:
     buf = torch.empty(shape, dtype=dtype, device=device)
-    dist.recv(buf, src=ps.global_rank(ps.pp_rank - 1, ps.tp_rank))
+    dist.recv(buf, src=ps.global_rank(ps.pp_rank - 1, ps.tp_rank), tag=HIDDEN_TAG)
     return buf
 
 
@@ -170,21 +184,31 @@ def all_ranks_min(ps: ParallelState, value: int) -> int:
     return int(t.item())
 
 
-def broadcast_ints(ps: ParallelState, payload: torch.Tensor | None) -> torch.Tensor:
-    """Driver -> every rank: a 1-D int64 CPU tensor, length first."""
-    length = torch.tensor([0 if payload is None else payload.numel()], dtype=torch.int64)
-    dist.broadcast(length, src=0, group=ps.control_group)
-    if payload is None:
-        payload = torch.empty(int(length.item()), dtype=torch.int64)
-    dist.broadcast(payload, src=0, group=ps.control_group)
-    return payload
+def send_plan(ps: ParallelState, plan: torch.Tensor) -> list[tuple]:
+    """Driver -> every other rank: the plan's length, then the plan (1-D int64, CPU). Returns the
+    (work, tensor) pairs, which must stay alive until they complete."""
+    length = torch.tensor([plan.numel()], dtype=torch.int64)
+    handles = []
+    for rank in range(1, ps.world_size):
+        handles.append((dist.isend(length, dst=rank, group=ps.control_group, tag=PLAN_TAG), length))
+        handles.append((dist.isend(plan, dst=rank, group=ps.control_group, tag=PLAN_TAG), plan))
+    return handles
 
 
-def send_ints_to_driver(ps: ParallelState, payload: torch.Tensor) -> None:
-    dist.send(payload, dst=0, group=ps.control_group)
+def recv_plan(ps: ParallelState) -> torch.Tensor:
+    length = torch.empty(1, dtype=torch.int64)
+    dist.recv(length, src=0, group=ps.control_group, tag=PLAN_TAG)
+    plan = torch.empty(int(length.item()), dtype=torch.int64)
+    dist.recv(plan, src=0, group=ps.control_group, tag=PLAN_TAG)
+    return plan
 
 
-def recv_ints_on_driver(ps: ParallelState, numel: int, src: int) -> torch.Tensor:
+def isend_result(ps: ParallelState, payload: torch.Tensor) -> tuple:
+    """Sampling rank -> driver: one step's tokens (and debug top-k). Returns (work, tensor)."""
+    return dist.isend(payload, dst=0, group=ps.control_group, tag=RESULT_TAG), payload
+
+
+def irecv_result(ps: ParallelState, numel: int, src: int) -> tuple:
+    """Posted by the driver when it submits the step, before the result can exist."""
     buf = torch.empty(numel, dtype=torch.int64)
-    dist.recv(buf, src=src, group=ps.control_group)
-    return buf
+    return dist.irecv(buf, src=src, group=ps.control_group, tag=RESULT_TAG), buf

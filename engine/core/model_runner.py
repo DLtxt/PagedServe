@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 from engine.config import EngineConfig
 from engine.core.sampler import Sampler
-from engine.distributed.parallel import SINGLE, ParallelState, all_ranks_min, recv_from_prev_stage, send_to_next_stage
+from engine.distributed.parallel import SINGLE, ParallelState, all_ranks_min, isend_to_next_stage, recv_from_prev_stage
 from engine.core.scheduler import ScheduledBatch
 from engine.core.sequence import SamplingParams
 from engine.model.attention import AttentionMetadata, KVCache, NaivePagedAttention
@@ -53,6 +53,9 @@ class ModelRunner:
         self.cpu_cache: torch.Tensor | None = None
         self.backend = None
         self.graph_runner = None
+        self._sends: list[tuple] = []  # non-blocking sends in progress: (work, tensor kept alive)
+        # Recorded after each step's attention plan: see execute().
+        self._staged = torch.cuda.Event() if self.device.type == "cuda" else None
 
     @property
     def bytes_per_block(self) -> int:
@@ -110,7 +113,15 @@ class ModelRunner:
         if self.graph_runner is not None and self.graph_runner.can_run(batch):
             return self.graph_runner.run(batch)
         input_ids, positions, logits_indices, meta = self.prepare(batch)
+        if self._staged is not None:
+            # begin_step may refill page-locked memory the previous step's copy has yet to read:
+            # FlashInfer's plan() writes one pinned buffer per wrapper, then copies it to the GPU
+            # with cudaMemcpyAsync (attention/scheduler.cuh). A rank that samples syncs every step
+            # anyway; a pipeline stage that does not can get ahead of its GPU.
+            self._staged.synchronize()
         self.backend.begin_step(meta)
+        if self._staged is not None:
+            self._staged.record(torch.cuda.current_stream(self.device))
         ps = self.parallel
         if not ps.distributed:
             hidden = self.model(input_ids, positions, self.backend)
@@ -120,11 +131,21 @@ class ModelRunner:
                 hidden_in = recv_from_prev_stage(ps, (len(positions), self.hidden_size), self.dtype, self.device)
             hidden = self.model(input_ids, positions, self.backend, hidden_in)
             if not ps.is_last_stage:
-                send_to_next_stage(ps, hidden)
+                self.flush_sends()  # at most one hidden-state send outstanding per stage
+                self.track_send(isend_to_next_stage(ps, hidden))
                 return None
         if not any(batch.do_sample):
             return None
         return self.model.compute_logits(hidden.index_select(0, logits_indices))
+
+    def track_send(self, handle: tuple) -> None:
+        self._sends = [h for h in self._sends if not h[0].is_completed()]
+        self._sends.append(handle)
+
+    def flush_sends(self) -> None:
+        for work, _ in self._sends:
+            work.wait()
+        self._sends = []
 
     def prepare(self, batch: ScheduledBatch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, AttentionMetadata]:
         bs = self.block_size

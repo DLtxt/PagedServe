@@ -356,6 +356,15 @@ def test_prompt_too_long_for_max_model_len_is_rejected():
         engine.add_request(Sequence(0, [1] * 30, SamplingParams(max_tokens=5)))
 
 
+def test_pipeline_depth_defaults_to_the_pipeline_size():
+    base = dict(device="cpu", num_blocks=8, max_model_len=64)
+    assert EngineConfig(**base, pipeline_parallel_size=2).resolve(4096).pipeline_depth == 2
+    assert EngineConfig(**base, pipeline_parallel_size=2, pipeline_depth=1).resolve(4096).pipeline_depth == 1
+    assert EngineConfig(**base).resolve(4096).pipeline_depth == 1
+    with pytest.raises(ValueError, match="pipeline_depth"):
+        EngineConfig(**base, pipeline_depth=0)
+
+
 def test_no_chunking_raises_budget_to_max_model_len():
     cfg = EngineConfig(device="cpu", num_blocks=8, max_model_len=4096, max_batch_tokens=2048).resolve(32768)
     assert cfg.max_batch_tokens == 4096
@@ -363,16 +372,130 @@ def test_no_chunking_raises_budget_to_max_model_len():
     assert cfg.max_batch_tokens == 2048
 
 
+# --- pipelined scheduling: several batches in flight -------------------------------------------------
+#
+# The local executor runs a batch the moment it is submitted, which a pipeline does too as far as any
+# one stage's cache is concerned: every stage executes batches in submission order. What these tests
+# exercise is the scheduler's side: batches submitted before earlier ones have returned.
+
+
+def test_pipeline_splits_running_sequences_into_disjoint_balanced_batches():
+    engine = make_engine(pipeline_depth=2, max_num_seqs=8)
+    rng = random.Random(10)
+    params = SamplingParams(temperature=0, max_tokens=20, ignore_eos=True)
+    seqs = [Sequence(i, random_prompt(rng, 6), params) for i in range(8)]
+    submitted = []  # per submission: its sequence ids, the ids already in flight, the running count
+    submit = engine.executor.submit
+
+    def recording_submit(batch):
+        in_flight = {s.seq_id for b, _ in engine.in_flight for s in b.seqs}
+        submitted.append(({s.seq_id for s in batch.seqs}, in_flight, len(engine.scheduler.running)))
+        return submit(batch)
+
+    engine.executor.submit = recording_submit
+    texts = run(engine, seqs)
+    for s in seqs:
+        assert (s.output_token_ids, texts[s.seq_id]) == expected(s.prompt_token_ids, params)
+    assert all(not ids & in_flight for ids, in_flight, _ in submitted), "a sequence was in two batches at once"
+    assert any(in_flight for _, in_flight, _ in submitted), "the pipeline never held two batches"
+    # All eight are admitted in one prefill batch; after that each batch takes half of them.
+    assert {len(ids) for ids, _, running in submitted[1:] if running == 8} == {4}
+    assert_idle_and_clean(engine)
+
+
+def test_abort_in_flight_waits_for_its_batch_and_keeps_tokens_aligned():
+    """Aborting a sequence whose batch is in flight only marks it, since pipeline stages may still be
+    writing its blocks. When the batch returns the sequence is dropped and the token sampled for it
+    is discarded, so the next sequence in that batch still gets its own token."""
+    engine = make_engine(pipeline_depth=2, max_num_seqs=4)
+    rng = random.Random(11)
+    params = SamplingParams(temperature=0, max_tokens=12, ignore_eos=True)
+    seqs = [Sequence(i, random_prompt(rng, 5), params) for i in range(4)]
+    victim, neighbour = seqs[2], seqs[3]
+    # Otherwise handing the neighbour the victim's token would go unnoticed.
+    assert expected(victim.prompt_token_ids, params)[0][1] != expected(neighbour.prompt_token_ids, params)[0][1]
+    texts = {s.seq_id: "" for s in seqs}
+
+    def step():
+        for out in engine.step():
+            texts[out.seq_id] += out.text
+
+    for s in seqs:
+        engine.add_request(s)
+    step()  # one prefill batch for all four
+    step()  # decodes in two batches: {0, 1} has returned, {2, 3} is still in flight
+    ((batch, _),) = engine.in_flight
+    assert [s.seq_id for s in batch.seqs] == [2, 3]
+    free_before = engine.block_manager.num_free_blocks
+    engine.abort(victim.seq_id)
+    engine.abort(victim.seq_id)  # idempotent while pending
+    assert victim.status == SequenceStatus.RUNNING and victim.abort_requested
+    assert engine.block_manager.num_free_blocks == free_before, "freed blocks a batch in flight is using"
+    step()  # {2, 3} returns
+    assert victim.status == SequenceStatus.ABORTED and not victim.block_table
+    assert victim.seq_id not in engine.scheduler.seqs and engine.scheduler.num_aborted == 1
+    while engine.has_work():
+        step()
+    for s in (seqs[0], seqs[1], neighbour):
+        assert (s.output_token_ids, texts[s.seq_id]) == expected(s.prompt_token_ids, params)
+    assert len(victim.output_token_ids) == 1, "the victim kept a token sampled after its abort"
+    assert_idle_and_clean(engine)
+
+
+def test_out_of_blocks_waits_for_a_batch_in_flight_instead_of_preempting_it():
+    """a runs out of blocks while b, the only newer sequence, is in flight. b cannot be preempted
+    until its batch returns, and a is not alone, so a must neither preempt b nor fail: it waits a
+    step, then preempts b once b is back."""
+    engine = make_engine(pipeline_depth=2, num_blocks=4, max_num_seqs=2, max_model_len=64, watermark=0.0)
+    rng = random.Random(12)
+    params = SamplingParams(temperature=0, max_tokens=10, ignore_eos=True)  # 14 tokens: 4 blocks each
+    a, b = (Sequence(i, random_prompt(rng, 4), params) for i in range(2))
+    texts = run(engine, [a, b])
+    for s in (a, b):
+        assert (s.output_token_ids, texts[s.seq_id]) == expected(s.prompt_token_ids, params)
+    assert a.num_preemptions == 0 and b.num_preemptions >= 1
+    assert_idle_and_clean(engine)
+
+
+def test_failed_step_forgets_the_batches_in_flight():
+    engine = make_engine(pipeline_depth=2, max_num_seqs=4)
+    rng = random.Random(13)
+    params = SamplingParams(temperature=0, max_tokens=30, ignore_eos=True)
+    seqs = [Sequence(i, random_prompt(rng, 5), params) for i in range(4)]
+    for s in seqs:
+        engine.add_request(s)
+    engine.step()
+    engine.step()
+    ((batch, _),) = engine.in_flight
+    pending = batch.seqs[0]
+    engine.abort(pending.seq_id)  # deferred: its batch is in flight
+
+    def dead_rank(handle):
+        raise RuntimeError("rank 1 is gone")
+
+    engine.executor.wait = dead_rank
+    with pytest.raises(RuntimeError, match="rank 1 is gone"):
+        engine.step()
+    assert not engine.in_flight and not any(s.in_flight for s in engine.scheduler.running)
+    assert pending.status == SequenceStatus.ABORTED, "the pending abort was lost with its batch"
+    for s in seqs:  # what the server does after a failed step
+        engine.abort(s.seq_id)
+    assert not engine.has_work()
+    assert_idle_and_clean(engine)
+
+
 # --- randomized stress: every mode x policy x preemption x prefix caching ----------------------------
 
 
+@pytest.mark.parametrize("depth", [1, 2, 3])  # batches in flight; > 1 is pipelined scheduling
 @pytest.mark.parametrize("trial", [0, 1])
 @pytest.mark.parametrize("chunked", [False, True])
 @pytest.mark.parametrize("prefix", [False, True])
 @pytest.mark.parametrize("preemption", ["recompute", "swap"])
 @pytest.mark.parametrize("policy", ["fcfs", "sjf", "priority"])
-def test_randomized_stress(chunked, prefix, preemption, policy, trial):
-    seed = zlib.crc32(repr((chunked, prefix, preemption, policy, trial)).encode())  # stable across runs
+def test_randomized_stress(chunked, prefix, preemption, policy, trial, depth):
+    # Stable across runs, and the same workload at every depth.
+    seed = zlib.crc32(repr((chunked, prefix, preemption, policy, trial)).encode())
     rng = random.Random(seed)
     block_size = rng.choice([1, 2, 4, 8])
     engine = make_engine(
@@ -388,7 +511,15 @@ def test_randomized_stress(chunked, prefix, preemption, policy, trial):
         aging_rate=rng.choice([0.0, 50.0]),
         # 8 host tokens: swap space runs out and preemption falls back to recompute; 128: it doesn't.
         host_blocks=max(1, rng.choice([8, 128]) // block_size) if preemption == "swap" else 0,
+        pipeline_depth=depth,
     )
+    submit = engine.executor.submit
+
+    def bounded_submit(batch):
+        assert len(engine.in_flight) < depth, "more batches in flight than pipeline_depth"
+        return submit(batch)
+
+    engine.executor.submit = bounded_submit
     shared = [random_prompt(rng, rng.randrange(1, 30)) for _ in range(3)]  # common prefixes
     pending = []
     for i in range(40):

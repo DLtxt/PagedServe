@@ -1,0 +1,14 @@
+{
+  "_comment": "Qwen3-14B (about 28 GB in bf16) does not fit one 24 GB GPU: it runs only because it is split. Tensor parallel against pipeline parallel, pipelined and one batch at a time.",
+  "model": "Qwen/Qwen3-14B-Base",
+  "workload": "bench/data/sharegpt.jsonl",
+  "rates": [1, 2, 4, 8, 12],
+  "duration": 45,
+  "server_args": ["--model", "Qwen/Qwen3-14B-Base", "--max-model-len", "4096", "--enable-chunked-prefill",
+                  "--max-batch-tokens", "2048", "--enable-prefix-caching"],
+  "configs": [
+    {"label": "tp2", "args": ["--tensor-parallel-size", "2"]},
+    {"label": "pp2", "args": ["--pipeline-parallel-size", "2"]},
+    {"label": "pp2-depth1", "args": ["--pipeline-parallel-size", "2", "--pipeline-depth", "1"]}
+  ]
+}

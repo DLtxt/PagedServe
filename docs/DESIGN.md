@@ -16,6 +16,9 @@ tokens  = sampler(logits, sampling)
 outputs = scheduler.update(batch, tokens)   # append, detokenize, check stops, free finished
 ```
 
+Under pipeline parallelism the same loop keeps several batches in flight instead of one; see
+[Pipelining](#pipelining-several-batches-in-flight).
+
 Any stall inside a step is added to the latency of every request currently decoding, not just the one
 that caused it. That is why HTTP handling is async and the engine is not, and why they talk only
 through queues: `AsyncEngine.run_loop` (`engine/api/server.py`) runs `step()` as a task on the event
@@ -102,7 +105,7 @@ refcount(b) == number of live block tables containing b, for every block b
 The plan's `len(free) + sum(len(table)) == num_blocks` is the special case with no sharing; with prefix
 caching it is false by design (shared blocks are counted once per table, cached blocks are in no
 table). Each running sequence also satisfies `len(block_table) == ceil(num_computed_tokens / block_size)`
-at step boundaries. The host swap pool has the same accounting.
+at step boundaries, counting its tokens in flight too when the engine is pipelined. The host swap pool has the same accounting.
 
 ### Prefix caching
 
@@ -264,6 +267,123 @@ queue future every iteration, so the cancellation starved for the whole generati
 disconnect signal and hands the generator a terminal output. Non-streaming requests, which Starlette does
 not watch at all, get a disconnect watcher that does the same.
 
+## Tensor and pipeline parallelism (`engine/distributed/`)
+
+One process per GPU, launched by torchrun (tests use `local_cluster`, which starts the other ranks as
+child processes). With tensor-parallel size T and pipeline-parallel size P there are T·P ranks, laid
+out stage-major: tp rank t of stage s is global rank s·T + t. Rank 0 is the driver: it runs the
+scheduler, block manager, tokenizer and HTTP server, and it is also stage 0's tp rank 0. Every other
+rank sits in `worker_loop`: receive a plan, run its share of the step, repeat.
+
+```
+        ┌─────────────────────────┐ all-reduce, twice   ┌─────────────────────────┐
+stage 0 │ rank 0: the driver      │◀───────────────────▶│ rank 1                  │
+        │ layers 0-13, tp rank 0  │ per layer (NCCL)    │ layers 0-13, tp rank 1  │
+        └────────────┬────────────┘                     └────────────┬────────────┘
+                     │ hidden states (NCCL)                          │
+        ┌────────────▼────────────┐                     ┌────────────▼────────────┐
+stage 1 │ rank 2                  │◀───────────────────▶│ rank 3                  │
+        │ layers 14-27, tp rank 0 │                     │ layers 14-27, tp rank 1 │
+        │ gathers logits, samples │                     └─────────────────────────┘
+        └─────────────────────────┘
+
+control plane (gloo, CPU tensors): rank 0 sends every rank each step's plan, rank 2 sends back the
+sampled tokens
+```
+
+**Two planes.** The data plane (the all-reduces inside every layer, the logits gather, hidden states
+between stages) is NCCL on GPUs and gloo on CPUs. The control plane (each step's plan out, the sampled
+tokens back) is always gloo on CPU tensors, so reading a plan never costs a GPU sync.
+
+**Tensor parallelism**, Megatron style. q/k/v and gate/up are column-parallel: each rank holds its
+share of the heads and of the intermediate dimension. o_proj and down_proj are row-parallel, each
+followed by one all-reduce, so two per layer. QK-norm is per head and needs no communication. The
+embedding table is split by vocabulary (each rank looks up the ids in its range, zeroes the rest, and
+the ranks all-reduce), and so is lm_head: the last stage gathers the vocabulary shards onto its tp
+rank 0, which samples. Each rank's KV cache holds only its own KV heads. A layout must divide the
+attention heads, the KV heads, the intermediate size and the vocabulary; `check_parallel` names the
+one that does not. Qwen3-0.6B and 8B have 8 KV heads, so tensor parallelism goes up to 8.
+
+**Pipeline parallelism.** Each stage owns a contiguous block of layers, earlier stages taking any
+remainder. The first stage embeds, the last applies the final norm and lm_head, and with tied
+weights the last stage loads the embedding table too. Stages pass `[tokens, hidden]` down the line.
+
+**Block ids are global.** The scheduler and block manager exist only on the driver, and a plan names
+blocks by id, so every rank must hold the same number of blocks: each sizes its own cache (by
+profiling, or `--num-blocks`) and all take the smallest (`all_ranks_min`). A block id then names the
+same page on every rank, each holding its own layers and heads of it.
+
+**The plan** (`encode_plan`) is one int64 tensor per step: each sequence's computed-token count, its
+new tokens, whether it samples, and the block-table pages the step touches; the swap copies; and the
+sampling parameters as float64 bits. Workers turn it back into a lightweight batch view that the
+unchanged `ModelRunner` reads like a `ScheduledBatch`.
+
+**The loader** slices tensors lazily with safetensors' `get_slice`, so no rank ever reads the whole
+checkpoint, and stays strict: the only tensors a rank may leave unread belong to other stages.
+
+### Pipelining: several batches in flight
+
+With one batch at a time, pipeline parallelism buys memory but not speed: while stage 1 works on a
+batch, stage 0 has nothing to do, so a P-stage pipeline idles (P−1)/P of the time. The engine keeps up
+to `pipeline_depth` batches in flight instead (default: the number of stages). A pipelined step tops
+the pipeline up, then completes the oldest batch:
+
+```python
+while len(in_flight) < depth and not (batch := scheduler.schedule()).is_empty():
+    scheduler.mark_in_flight(batch)
+    in_flight.append((batch, executor.submit(batch)))   # returns once stage 0's share is launched
+batch, handle = in_flight.popleft()
+outputs = scheduler.update(batch, executor.wait(handle).tokens)
+```
+
+Stage 0 runs batch k+1 while stage 1 runs batch k.
+
+**Why it is correct.** Every rank executes plans in the order they were sent, and each stage's KV
+cache is touched only by that stage, so per stage the cache evolves exactly as it would one batch at a
+time. What changes is the scheduler's side: it plans batch k+1 before batch k has come back.
+
+- A sequence in flight is never scheduled again, since its next token is unknown, so the batches in
+  flight are disjoint.
+- It is never a preemption victim and never failed. A sequence that runs out of blocks while every
+  newer sequence is in flight waits a step: those become preemptible when their batch returns.
+  Failing it as the lone sequence would be wrong, since it is not alone.
+- Aborting it takes effect only when its batch returns, because pipeline stages may still be writing
+  its blocks; the token sampled for it is discarded then. No block is freed, and so none is reused,
+  while a batch in flight can still touch it.
+- Blocks are published to the prefix cache only when their batch returns, so a request can hit only
+  K/V that every stage has finished writing.
+
+**Keeping the pipeline full.** Sequences that return together are scheduled together, so a burst
+admitted in one batch would travel as one batch forever and the pipeline would overlap nothing. Each
+batch therefore takes at most ⌈running / depth⌉ of the running sequences, oldest first: eight
+sequences admitted together become two batches of four
+(`test_pipeline_splits_running_sequences_into_disjoint_balanced_batches`).
+
+**The control plane is point to point.** The first version broadcast each plan. A broadcast is a
+collective every rank enters together, so the driver could not hand stage 0 batch k+1 before the last
+stage had finished batch k, and the pipeline could never hold two batches. Plans now go out as
+non-blocking sends, results come back the same way (the driver posts the receive when it submits the
+step, before the result can exist), hidden states move by `isend`, and each kind of message has its
+own tag, so every rank receives each kind in order.
+
+**A GPU-only race, closed.** A rank that samples synchronizes with its GPU every step; a pipeline stage
+that does not can get ahead of it. FlashInfer's `plan()` writes into one pinned buffer per wrapper and
+copies it to the GPU with `cudaMemcpyAsync` (flashinfer 0.7.0, `attention/scheduler.cuh`), so a stage
+planning step k+1 before its GPU had executed step k's copy would corrupt it. The runner records an
+event after each plan and waits on it before the next; for a rank that is caught up, the wait is free.
+
+**Shutdown and failure.** A worker's lifetime is the driver's. Workers ignore SIGINT and SIGTERM, which
+torchrun forwards to every rank, and stop only on the driver's shutdown plan; they execute every plan
+sent before it, so stopping drains the pipeline. Each rank then waits for its GPU before tearing NCCL
+down, since its last transfers may still be running. (A worker that died of the signal would leave the
+driver waiting on it: see `docs/BUGLOG.md`.) If a submit or a wait raises (a rank died), the engine forgets the batches in
+flight and lets deferred aborts take effect, so the server's fail-everything path still frees every
+block.
+
+**Not done**: CUDA graphs under tensor or pipeline parallelism (they are single-GPU for now);
+overlapping the driver's CPU work with its own GPU under tensor parallelism alone; sequence and expert
+parallelism. Data parallelism is more servers behind a load balancer.
+
 ## Testing strategy
 
 The gates of the plan, each a test file, run in fp32 against the real weights:
@@ -293,9 +413,18 @@ whose V stores its position. Instead of attention it reads each sequence's histo
 paged cache through the naive backend and emits a token that hashes the whole history, so any paging,
 prefix-sharing, chunking or swap bug changes some sequence's output compared with a direct computation.
 Randomized stress runs cover every mode, policy, preemption strategy and prefix setting with requests
-arriving and aborting mid-run, checking invariants after every step. Mutation testing (planting known
-bugs one at a time) confirmed the suite catches paging bugs; attention-math bugs are left to the
-real-model gates.
+arriving and aborting mid-run, checking invariants after every step, and runs every configuration
+again at pipeline depths 2 and 3. Mutation testing (planting known bugs one at a time) confirmed the
+suite catches paging and pipelining bugs; attention-math bugs are left to the real-model gates.
+
+**Distributed** (`tests/test_distributed.py`). Every layout must give the single-process tokens under the
+near-tie rule: TP=2; PP=2 one batch at a time and pipelined; TP=2 × PP=2; and PP=3, whose middle stage
+both receives and sends. They run on a tiny random-weight Qwen3, again with prefix caching, chunked
+prefill and swapping, then on Qwen3-0.6B split both ways, then through a torchrun-launched server with
+one client disconnecting while another request completes. Every pipelined run asserts the pipeline
+really held `depth` batches at once. On CPU the ranks talk over gloo; under
+`PAGEDSERVE_TEST_DEVICE=cuda` over NCCL, one GPU per rank, where a bf16 FlashInfer check also covers the
+exact configuration the distributed benchmarks run.
 
 ## Debugging
 
@@ -326,8 +455,8 @@ The plan's playbook, mapped to what the engine provides:
 
 ## Deliberately left out
 
-- Multi-GPU (tensor or pipeline parallelism) and multi-replica routing: cluster-layer concerns, out of
-  scope by the plan.
+- Multi-replica routing and data parallelism: more servers behind a load balancer, a cluster-layer
+  concern. (Tensor and pipeline parallelism are implemented, above.)
 - Speculative decoding, quantized KV caches, LoRA: each a project of its own.
 - Per-request seeds, logprobs, `n > 1`, penalties: rejected explicitly rather than half-supported.
 - Swapping of shared prefix blocks as shared: a swapped sequence copies its shared blocks too and gets

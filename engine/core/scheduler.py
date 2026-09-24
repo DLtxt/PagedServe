@@ -20,6 +20,12 @@ Preemption victims are the newest running sequences. Recompute victims wait in `
 every new request, in their original order; swap victims wait in `swapped`. Nothing new is admitted
 while anything is swapped out, and a step that preempts admits nothing, so one step never both
 swaps out and swaps in.
+
+Under pipeline parallelism several batches are in flight at once (config.pipeline_depth). A sequence
+in a submitted batch stays in flight until that batch's result comes back: it is not scheduled again
+(its next token is unknown), it is never a preemption victim, and aborting it takes effect only when
+the batch returns, because pipeline stages may still be writing its blocks. Each batch takes at most
+its share of the running sequences, so the batches in flight stay about equal in size.
 """
 
 from __future__ import annotations
@@ -130,6 +136,7 @@ class Scheduler:
         self.max_batch_tokens = config.max_batch_tokens
         self.max_model_len = config.max_model_len
         self.preemption_mode = config.preemption_mode
+        self.pipeline_depth = config.pipeline_depth or 1
         self.eos_ids = frozenset(eos_token_ids)
 
         self.waiting = WaitingQueue(config.admission_policy, config.aging_rate)
@@ -154,11 +161,15 @@ class Scheduler:
         self.waiting.push(seq)
 
     def abort(self, seq_id: int) -> bool:
-        """Drop a request in any state and free its blocks. Idempotent: unknown or already
-        finished ids are ignored."""
-        seq = self.seqs.pop(seq_id, None)
-        if seq is None:
+        """Drop a request in any state and free its blocks. Idempotent: unknown, finished or
+        already aborted ids are ignored. A sequence in flight is dropped when its batch returns."""
+        seq = self.seqs.get(seq_id)
+        if seq is None or seq.abort_requested:
             return False
+        if seq.in_flight:
+            seq.abort_requested = True
+            return True
+        del self.seqs[seq_id]
         if seq.status == SequenceStatus.RUNNING:
             self.running.remove(seq)
             self.bm.free(seq)
@@ -175,6 +186,19 @@ class Scheduler:
 
     def has_work(self) -> bool:
         return bool(self.running or self.swapped or self.preempted or len(self.waiting))
+
+    def mark_in_flight(self, batch: ScheduledBatch) -> None:
+        for seq, n in zip(batch.seqs, batch.num_new_tokens):
+            seq.in_flight_tokens = n
+
+    def clear_in_flight(self) -> None:
+        """Forget every batch in flight, after a failed step lost them, so that aborts take effect
+        at once again."""
+        for seq in list(self.running):
+            seq.in_flight_tokens = 0
+            if seq.abort_requested:
+                seq.abort_requested = False
+                self.abort(seq.seq_id)
 
     def take_outputs(self) -> list[RequestOutput]:
         outputs, self._outputs = self._outputs, []
@@ -217,12 +241,18 @@ class Scheduler:
         while i < len(running):
             seq = running[i]
             n = plan[seq]
-            if n == 0:
+            if n == 0:  # in flight, or no share of the budget this step
                 i += 1
                 continue
             while not self.bm.can_append(seq, n):
-                if i < len(running) - 1:
-                    self._preempt(running.pop(), batch)
+                victim = next((j for j in range(len(running) - 1, i, -1) if not running[j].in_flight), None)
+                if victim is not None:
+                    self._preempt(running.pop(victim), batch)
+                elif i < len(running) - 1:
+                    # Everything newer is in flight and cannot be preempted until its batch returns;
+                    # this sequence waits a step instead.
+                    i += 1
+                    break
                 else:
                     running.pop(i)
                     if i == 0:
@@ -238,13 +268,20 @@ class Scheduler:
                 i += 1
 
     def _plan_running_tokens(self) -> dict[Sequence, int]:
-        if not self.chunked:
-            return {seq: 1 for seq in self.running}  # prefill-priority: running sequences only decode
+        """Tokens each running sequence computes this step; 0 leaves it out."""
+        ready = [s for s in self.running if not s.in_flight]
+        if self.pipeline_depth > 1:
+            # A batch takes at most its share of the running sequences, oldest first, so a burst
+            # admitted together still spreads over the pipeline instead of travelling as one batch.
+            ready = ready[: -(-len(self.running) // self.pipeline_depth)]
+        plan = dict.fromkeys(self.running, 0)
+        if not self.chunked:  # prefill-priority: running sequences only decode
+            plan.update(dict.fromkeys(ready, 1))
+            return plan
         # Decode-first: every decode gets its token before any prefill chunk gets budget.
-        # len(running) <= max_num_seqs <= max_batch_tokens, so the decodes always fit.
-        left = self.max_batch_tokens - sum(1 for s in self.running if s.num_uncomputed_tokens == 1)
-        plan = {}
-        for seq in self.running:
+        # len(ready) <= max_num_seqs <= max_batch_tokens, so the decodes always fit.
+        left = self.max_batch_tokens - sum(1 for s in ready if s.num_uncomputed_tokens == 1)
+        for seq in ready:
             if seq.num_uncomputed_tokens == 1:
                 plan[seq] = 1
             else:
@@ -304,6 +341,7 @@ class Scheduler:
             assert popped is seq
 
     def _preempt(self, seq: Sequence, batch: ScheduledBatch) -> None:
+        assert not seq.in_flight, f"seq {seq.seq_id} preempted while in flight"
         seq.num_preemptions += 1
         self.num_preemptions += 1
         batch.num_preempted += 1
@@ -327,6 +365,7 @@ class Scheduler:
         )
 
     def _fail(self, seq: Sequence, message: str) -> None:
+        assert not seq.in_flight, f"seq {seq.seq_id} failed while in flight"
         if seq.block_table:
             self.bm.free(seq)
         if seq.cpu_block_table:
@@ -350,11 +389,19 @@ class Scheduler:
         tokens = iter(sampled)
         any_finished = False
         for seq, n, do_sample in zip(batch.seqs, batch.num_new_tokens, batch.do_sample):
+            seq.in_flight_tokens = 0
             seq.num_computed_tokens += n
+            token = next(tokens) if do_sample else None  # taken even for a dropped sequence
+            if seq.abort_requested:  # aborted while its batch was in flight: drop it now
+                self.bm.free(seq)
+                seq.status = SequenceStatus.ABORTED
+                self.seqs.pop(seq.seq_id, None)
+                self.num_aborted += 1
+                any_finished = True
+                continue
             self.bm.cache_full_blocks(seq)
             if not do_sample:
                 continue
-            token = next(tokens)
             text, finish = append_token(seq, token, self.eos_ids, self.max_model_len)
             if seq.first_token_time is None:
                 seq.first_token_time = now
@@ -377,7 +424,8 @@ class Scheduler:
         self.bm.check_invariants(self.running, self.swapped)
         for seq in self.running:
             assert seq.status == SequenceStatus.RUNNING and not seq.cpu_block_table, f"bad running seq {seq.seq_id}"
-            assert seq.num_uncomputed_tokens >= 1, f"running seq {seq.seq_id} has nothing left to compute"
+            assert seq.num_uncomputed_tokens >= max(1, seq.in_flight_tokens), f"running seq {seq.seq_id} has nothing left to compute"
+            assert seq.in_flight or not seq.abort_requested, f"seq {seq.seq_id} has an abort pending but is not in flight"
         for seq in self.swapped:
             assert seq.status == SequenceStatus.PREEMPTED and seq.cpu_block_table and not seq.block_table
         for seq in self.preempted:
@@ -391,7 +439,7 @@ class Scheduler:
 
     def describe(self) -> str:
         return (
-            f"running={[(s.seq_id, s.num_computed_tokens, s.num_tokens) for s in self.running]} "
+            f"running={[(s.seq_id, s.num_computed_tokens, s.num_tokens, s.in_flight_tokens) for s in self.running]} "
             f"swapped={[s.seq_id for s in self.swapped]} preempted={[s.seq_id for s in self.preempted]} "
             f"waiting={len(self.waiting)} free_blocks={self.bm.num_free_blocks}/{self.bm.num_blocks}"
         )

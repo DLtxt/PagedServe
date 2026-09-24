@@ -14,6 +14,7 @@ import dataclasses
 import logging
 import multiprocessing as mp
 import os
+import signal
 import socket
 
 import torch
@@ -29,6 +30,12 @@ logger = logging.getLogger(__name__)
 
 
 def run_worker(config: EngineConfig, parallel: ParallelState) -> None:
+    # A worker's lifetime is the driver's: the driver stops it with a shutdown plan once it has drained
+    # the batches in flight. A Ctrl-C reaches every rank, and torchrun forwards SIGINT and SIGTERM to
+    # every rank; a worker that died of it would leave the driver waiting on it. If the driver itself
+    # dies, torchrun kills the rest.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     path = resolve_model_path(config.model)
     config.resolve(load_config(path).max_position_embeddings)
     model = load_model(path, config.device, config.torch_dtype, parallel)

@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # The GPU half of PagedServe in one script: environment, correctness gates, benchmarks, baselines,
-# figures. Run from anywhere on a Linux machine with one NVIDIA GPU (16-24 GB); see docs/GPU_RUNBOOK.md.
+# figures. Run from anywhere on a Linux machine with NVIDIA GPUs (16-24 GB each); see docs/GPU_RUNBOOK.md.
 #
 #   scripts/gpu_suite.sh            # everything, in order (about 3 hours on an RTX 4090)
-#   scripts/gpu_suite.sh setup      # or one stage: setup | gates | bench | plots
+#   scripts/gpu_suite.sh setup      # or one stage: setup | gates | bench | dist | plots
+#
+# `dist` (tensor and pipeline parallelism, Qwen3-8B and 14B) needs two GPUs in the machine and about
+# 45 GB more disk for the two models; on a single-GPU machine it skips itself.
 #
 # Stages stop at the first failure. Gates run before any benchmark: a number measured on a path that
 # fails its gate means nothing.
@@ -94,6 +97,40 @@ bench() {
     --batch-size 32 --label hf-static --out "$RESULTS/latency"
 }
 
+dist() {
+  local gpus
+  gpus=$(nvidia-smi --list-gpus | wc -l)
+  if [ "$gpus" -lt 2 ]; then
+    echo "distributed stage skipped: it needs 2 GPUs in this machine, found $gpus"
+    return 0
+  fi
+  log "distributed correctness on $gpus GPUs: tensor and pipeline parallelism over NCCL match one GPU"
+  PAGEDSERVE_TEST_DEVICE=cuda $PY -m pytest tests/test_distributed.py -x -q -s
+
+  log "Qwen3-8B-Base (about 16 GB) and Qwen3-14B-Base (about 28 GB)"
+  for m in Qwen/Qwen3-8B-Base Qwen/Qwen3-14B-Base; do
+    $PY -c "from engine.model.loader import resolve_model_path; print(resolve_model_path('$m'))"
+  done
+
+  log "Qwen3-8B: one GPU, tensor parallel 2, pipeline parallel 2 (pipelined, then one batch at a time)"
+  $PY -m bench.run_bench sweep --spec bench/sweeps/distributed_8b.json --out "$RESULTS/distributed_8b"
+
+  log "baseline: vLLM, Qwen3-8B, tensor parallel 2, same traffic, same client"
+  mkdir -p "$RESULTS/distributed_8b"
+  .venv-vllm/bin/vllm serve Qwen/Qwen3-8B-Base --tensor-parallel-size 2 --host 127.0.0.1 --port 8001 \
+    --max-model-len 4096 --gpu-memory-utilization 0.9 > "$RESULTS/distributed_8b/vllm_server.log" 2>&1 &
+  VLLM_PID=$!
+  trap 'kill $VLLM_PID 2>/dev/null || true' EXIT
+  wait_healthy http://127.0.0.1:8001 "$VLLM_PID"
+  $PY -m bench.run_bench run --url http://127.0.0.1:8001 --model Qwen/Qwen3-8B-Base --workload bench/data/sharegpt.jsonl \
+    --rates 1,2,4,8,12,16 --duration 45 --label vllm-tp2 --out "$RESULTS/distributed_8b"
+  kill "$VLLM_PID"; wait "$VLLM_PID" 2>/dev/null || true
+  trap - EXIT
+
+  log "Qwen3-14B: too big for one 24 GB GPU; tensor parallel 2 against pipeline parallel 2"
+  $PY -m bench.run_bench sweep --spec bench/sweeps/distributed_14b.json --out "$RESULTS/distributed_14b"
+}
+
 plots() {
   log "figures and tables"
   $PY -m bench.plot --results "$RESULTS" --out bench/figures
@@ -104,7 +141,8 @@ case "$STAGE" in
   setup) setup ;;
   gates) gates ;;
   bench) bench ;;
+  dist) dist ;;
   plots) plots ;;
-  all) setup; gates; bench; plots ;;
-  *) echo "usage: $0 [setup|gates|bench|plots|all]"; exit 2 ;;
+  all) setup; gates; bench; dist; plots ;;
+  *) echo "usage: $0 [setup|gates|bench|dist|plots|all]"; exit 2 ;;
 esac

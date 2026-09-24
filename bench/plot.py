@@ -10,6 +10,7 @@ Reads the directories run_bench.py, hf_baseline.py and preemption_crossover.py w
     prefix_caching.png       TTFT against shared-prefix length with the cache on and off
     chunked_prefill.png      p99 inter-token latency over time with and without chunked prefill
     kv_usage.png             KV-cache utilization over time per request rate
+    distributed_<size>.png   p99 TTFT and p99 ITL against throughput per parallel layout (Qwen3-8B, 14B)
     results.md               every summary as a table (the table view of every chart)
 
     python -m bench.plot --results bench/results --out bench/figures
@@ -30,7 +31,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
-from matplotlib.ticker import FuncFormatter  # noqa: E402
+from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter  # noqa: E402
 
 # Validated reference palette (categorical, fixed order) and chart chrome, light surface.
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
@@ -79,10 +80,16 @@ def end_label(ax, x: float, y: float, text: str) -> None:
 
 
 def plain_ticks(axis) -> None:
-    """Plain numbers on a log axis ("0.5", "2", "100"), never "5 x 10^-1"."""
+    """Plain numbers on a log axis ("0.5", "2", "100"), never "5 x 10^-1". Past a decade of range the
+    ticks step 1-2-5, so labels never crowd; call after plotting, when the range is known."""
     fmt = FuncFormatter(lambda v, _: f"{v:g}")
+    lo, hi = sorted(axis.get_view_interval())
+    if lo > 0 and hi / lo > 10:
+        axis.set_major_locator(LogLocator(base=10, subs=(1.0, 2.0, 5.0)))
+        axis.set_minor_formatter(NullFormatter())
+    else:
+        axis.set_minor_formatter(fmt)
     axis.set_major_formatter(fmt)
-    axis.set_minor_formatter(fmt)
 
 
 def finish(fig, path: Path, source: str) -> None:
@@ -366,6 +373,43 @@ def kv_usage(results: Path, out: Path, label: str = "ours") -> None:
     finish(fig, out / "kv_usage.png", f"{results / 'latency'}/{label}_rate*_stats.csv")
 
 
+# Fixed series order for the parallel layouts, so a layout keeps its color across figures.
+LAYOUTS = ["tp1", "tp2", "pp2", "pp2-depth1", "vllm-tp2", "pp2-2nodes"]
+
+
+def distributed(results: Path, out: Path) -> None:
+    """One figure per model size: tail latency against throughput for each way of splitting it."""
+    for folder in sorted(results.glob("distributed_*")):
+        path = folder / "summary.csv"
+        if not path.exists():
+            continue
+        groups = by_label(read_csv(path))
+        present = list(groups)
+        size = folder.name.removeprefix("distributed_").upper()
+        fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.4))
+        for ax, metric, scale, ylabel in (
+            (axes[0], "ttft_p99", 1.0, "p99 time to first token (s, log scale)"),
+            (axes[1], "itl_p99", 1e3, "p99 inter-token latency (ms, log scale)"),
+        ):
+            for label, rows in groups.items():
+                color, marker = color_of(label, LAYOUTS, present)
+                pts = [(num(r["steady_tok_s"]) if not math.isnan(num(r["steady_tok_s"])) else num(r["throughput_tok_s"]),
+                        num(r[metric]) * scale) for r in rows]
+                pts = [(x, y) for x, y in pts if not (math.isnan(x) or math.isnan(y))]
+                if pts:
+                    xs, ys = zip(*pts)
+                    ax.plot(xs, ys, color=color, marker=marker, label=label)
+            ax.set_yscale("log")
+            plain_ticks(ax.yaxis)
+            ax.set_xlabel("Achieved throughput (output tokens/s, steady state)")
+            ax.set_ylabel(ylabel)
+        axes[0].set_title(f"Qwen3-{size}: latency vs throughput by parallel layout")
+        axes[1].set_title("Inter-token latency, same runs")
+        if len(groups) > 1:
+            axes[0].legend(loc="best")
+        finish(fig, out / f"{folder.name}.png", str(path))
+
+
 def tables(results: Path, out: Path) -> None:
     cols = ["label", "rate", "num_requests", "num_failed", "throughput_tok_s", "steady_tok_s", "ttft_p50", "ttft_p99",
             "itl_p50", "itl_p99", "e2e_p99", "preemptions_per_s", "kv_usage_mean", "peak_memory_gib"]
@@ -405,6 +449,7 @@ def main() -> None:
     prefix_caching(results, out)
     chunked_prefill(results, out)
     kv_usage(results, out)
+    distributed(results, out)
     tables(results, out)
 
 

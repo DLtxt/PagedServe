@@ -1,7 +1,7 @@
 """The engine loop. step() is the whole engine; everything else is the four objects it calls.
 
-step() is synchronous and never blocks on anything but the GPU: it advances every scheduled
-sequence by one iteration and returns. A stall here adds latency to every request that is decoding,
+step() is synchronous and never blocks on anything but the GPU (split across GPUs: on the result of
+the oldest batch in flight): it advances every scheduled sequence by one iteration and returns. A stall here adds latency to every request that is decoding,
 which is why the HTTP layer is async and talks to the engine only through queues.
 """
 
@@ -11,6 +11,7 @@ import csv
 import itertools
 import logging
 import time
+from collections import deque
 from collections.abc import Callable
 
 import torch
@@ -60,6 +61,10 @@ class LLMEngine:
             self.executor = DistributedExecutor(parallel, self.model_runner, self.sampler, config.block_size)
         else:
             self.executor = LocalExecutor(self.model_runner, self.sampler)
+        # Batches submitted but not yet returned, oldest first. Only pipeline parallelism overlaps
+        # them: stage 0 starts batch k+1 while later stages finish batch k.
+        self.pipeline_depth = config.pipeline_depth
+        self.in_flight: deque = deque()
         capacity = num_blocks * config.block_size
         if config.max_model_len > capacity:
             logger.warning(
@@ -88,6 +93,8 @@ class LLMEngine:
     # --- the loop --------------------------------------------------------------------------------
 
     def step(self) -> list[RequestOutput]:
+        if self.pipeline_depth > 1:
+            return self._step_pipelined()
         batch = self.scheduler.schedule()
         if batch.is_empty():
             outputs = self.scheduler.take_outputs()
@@ -101,6 +108,37 @@ class LLMEngine:
         if result.topk is not None and self.topk_hook is not None:
             self.topk_hook(batch, *result.topk)
         outputs = self.scheduler.update(batch, result.tokens)
+        self._after_step(batch, len(result.tokens), time.perf_counter() - start)
+        return outputs
+
+    def _step_pipelined(self) -> list[RequestOutput]:
+        """Top the pipeline up to pipeline_depth batches, then complete the oldest. Sequences in
+        flight are never scheduled again, so the batches in flight are disjoint."""
+        start = time.perf_counter()
+        try:
+            while len(self.in_flight) < self.pipeline_depth:
+                batch = self.scheduler.schedule()
+                if batch.is_empty():
+                    break
+                self.scheduler.mark_in_flight(batch)
+                self.in_flight.append((batch, self.executor.submit(batch)))
+            outputs = self.scheduler.take_outputs()
+            if not self.in_flight:
+                if not outputs and self.scheduler.has_work():
+                    raise RuntimeError(f"scheduler made no progress with work pending: {self.scheduler.describe()}")
+                return outputs
+            batch, handle = self.in_flight.popleft()
+            result = self.executor.wait(handle)
+        except Exception:
+            # The batches in flight are lost; forget them so their sequences can still be aborted.
+            self.in_flight.clear()
+            self.scheduler.clear_in_flight()
+            raise
+        if result.logits is not None and self.logits_hook is not None:
+            self.logits_hook(batch, result.logits)
+        if result.topk is not None and self.topk_hook is not None:
+            self.topk_hook(batch, *result.topk)
+        outputs += self.scheduler.update(batch, result.tokens)
         self._after_step(batch, len(result.tokens), time.perf_counter() - start)
         return outputs
 
@@ -127,10 +165,12 @@ class LLMEngine:
         self.executor.shutdown()
 
     def abort(self, seq_id: int) -> None:
-        self.scheduler.abort(seq_id)  # frees blocks; a no-op for finished or unknown ids
+        # Frees blocks now, or when the sequence's batch returns if it is in flight; a no-op for
+        # finished or unknown ids.
+        self.scheduler.abort(seq_id)
 
     def has_work(self) -> bool:
-        return self.scheduler.has_work()
+        return self.scheduler.has_work() or bool(self.in_flight)
 
     def new_seq_id(self) -> int:
         return next(self._ids)
@@ -173,6 +213,7 @@ class LLMEngine:
             "num_waiting": len(s.waiting),
             "num_preempted_waiting": len(s.preempted),
             "num_swapped": len(s.swapped),
+            "num_batches_in_flight": len(self.in_flight),
             "num_blocks": bm.num_blocks,
             "num_free_blocks": bm.num_free_blocks,
             "num_cached_free_blocks": len(bm.evictable),

@@ -85,6 +85,10 @@ class Sequence:
     num_cached_tokens: int = 0  # tokens served by the prefix cache at the latest admission
     cpu_block_table: list[int] = field(default_factory=list)  # KV parked in host memory by swap
     num_preemptions: int = 0
+    # Pipelined execution: this sequence's tokens in a submitted batch whose result has not come back
+    # (0 when it is in none), and an abort that has to wait for that batch.
+    in_flight_tokens: int = 0
+    abort_requested: bool = False
     output_text: str = ""  # decoded output, truncated at a stop string if one matched
     num_emitted_chars: int = 0  # prefix of output_text already returned to the client
     detokenizer: Any = None
@@ -107,6 +111,10 @@ class Sequence:
     @property
     def num_uncomputed_tokens(self) -> int:
         return len(self.token_ids) - self.num_computed_tokens
+
+    @property
+    def in_flight(self) -> bool:
+        return self.in_flight_tokens > 0
 
     @property
     def is_finished(self) -> bool:
