@@ -56,8 +56,8 @@ setup() {
 gates() {
   log "fail fast: gate 9 (FlashInfer vs naive), CUDA graphs vs eager, memory profiling"
   PAGEDSERVE_TEST_DEVICE=cuda $PY -m pytest tests/test_gpu.py -x -q -s
-  log "gates 1-8 on CUDA, fp32 (exact greedy, near-tie rule)"
-  PAGEDSERVE_TEST_DEVICE=cuda $PY -m pytest tests -x -q -s -m "not gpu"
+  log "gates 1-8 on CUDA, fp32 (exact greedy, near-tie rule); the split-model tests run in the dist stage"
+  PAGEDSERVE_TEST_DEVICE=cuda $PY -m pytest tests -x -q -s -m "not gpu and not distributed"
 }
 
 wait_healthy() {  # url, pid

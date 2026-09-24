@@ -64,7 +64,7 @@ export PAGEDSERVE_TEST_DEVICE=cuda
 .venv/bin/python -m pytest tests/test_gpu.py -q -s -k kernel    # FlashInfer vs naive, one attention call
 .venv/bin/python -m pytest tests/test_gpu.py -q -s -k engine    # FlashInfer vs naive, end to end
 .venv/bin/python -m pytest tests/test_gpu.py -q -s -k graphs    # CUDA graphs vs eager
-.venv/bin/python -m pytest tests -q -s -m "not gpu" -x          # gates 1-8
+.venv/bin/python -m pytest tests -q -s -m "not gpu and not distributed" -x   # gates 1-8
 ```
 
 If only the CUDA-graph test fails, the benchmarks can still run without graphs: remove `--cuda-graphs`
@@ -80,7 +80,14 @@ NCCL_DEBUG=INFO scripts/gpu_suite.sh dist                                       
 
 ## 4. Bring the results back
 
+Copy them to your own machine and commit there, so the rented box never holds GitHub credentials and
+the commit carries your usual identity:
+
 ```bash
+# on your machine, in the repository, on the branch the suite ran
+rsync -av <user>@<gpu-box>:PagedServe/bench/results/ bench/results/
+rsync -av <user>@<gpu-box>:PagedServe/bench/figures/ bench/figures/
+scp <user>@<gpu-box>:PagedServe/gpu_suite.log .   # for reading, not for committing
 git add bench/results bench/figures
 git commit -m "GPU results on <GPU model>"
 git push
