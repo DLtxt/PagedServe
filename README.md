@@ -1,6 +1,6 @@
 # PagedServe
 
-A single-GPU LLM inference engine: paged KV-cache memory management, iteration-level continuous
+An LLM inference engine: paged KV-cache memory management, iteration-level continuous
 batching, prefix caching, chunked prefill, recompute and swap preemption, and a streaming
 OpenAI-compatible HTTP API. It serves `Qwen/Qwen3-0.6B-Base`.
 
